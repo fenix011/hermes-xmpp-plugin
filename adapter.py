@@ -241,13 +241,23 @@ class XmppAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         client = ClientXMPP(self.jid, self._password)
-        # Plugins
+        # Plugins - core
         for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0363"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
             except Exception:
                 logger.warning("xmpp: failed to register slixmpp plugin %s", plugin)
+
+        # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
+        # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
+        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447"):
+            try:
+                client.register_plugin(plugin)
+                self._registered_plugins.add(plugin)
+                logger.debug("xmpp: registered slixmpp plugin %s", plugin)
+            except Exception:
+                logger.warning("xmpp: slixmpp plugin %s not available", plugin)
 
         # OMEMO plugin registration
         omemo_ok = False
@@ -432,12 +442,35 @@ class XmppAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 user_name=user_name,
             )
+            # Extract reply context for XEP-0461
+            reply_to_message_id = None
+            reply_to_text = None
+            if self.client is not None and stanza_to_dispatch is not None:
+                try:
+                    reply_elem = stanza_to_dispatch.get("reply", None)
+                    if reply_elem is not None:
+                        reply_to_message_id = reply_elem.get("id", None)
+                        # Build fallback body from the reply for context injection
+                        raw_body = stanza_to_dispatch.get("body", "") or ""
+                        # If the reply has fallback markers, strip them
+                        if hasattr(reply_elem, "strip_fallback_content"):
+                            stripped = reply_elem.strip_fallback_content()
+                            if stripped:
+                                reply_to_text = stripped
+                            else:
+                                reply_to_text = raw_body
+                        else:
+                            reply_to_text = raw_body
+                except Exception:
+                    pass
             event = MessageEvent(
                 text=body,
                 message_type=MessageType.TEXT,
                 source=source,
                 raw_message=stanza_to_dispatch,
                 message_id=stanza.get("id") or None,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
             )
             await self.handle_message(event)
         except Exception:
