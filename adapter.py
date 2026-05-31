@@ -54,6 +54,7 @@ from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 
@@ -235,6 +236,10 @@ class XmppAdapter(BasePlatformAdapter):
         self._known_mucs = {r.room for r in self.muc_rooms}
         self._registered_plugins: set[str] = set()
 
+        # Reaction state: message_id → original stanza (for lifecycle hooks)
+        self._pending_reactions: Dict[str, Any] = {}
+        self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -359,6 +364,11 @@ class XmppAdapter(BasePlatformAdapter):
                 logger.exception("xmpp: failed to join MUC %s", room.room)
         if self._session_ready is not None:
             self._session_ready.set()
+        # Register ad-hoc commands now that session is active
+        try:
+            await self._setup_adhoc_commands()
+        except Exception:
+            logger.debug("xmpp: ad-hoc command setup failed", exc_info=True)
 
     async def _on_disconnected(self, _event: Any) -> None:
         self._mark_disconnected()
@@ -619,14 +629,6 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         return await self._upload_and_send(chat_id, path, caption)
 
-    async def send_voice(
-        self,
-        chat_id: str,
-        path: str,
-        **kwargs,
-    ) -> SendResult:
-        return await self._upload_and_send(chat_id, path, caption=None)
-
     async def send_video(
         self,
         chat_id: str,
@@ -676,6 +678,245 @@ class XmppAdapter(BasePlatformAdapter):
                 pass
             return SendResult(success=True, message_id=msg_id, raw_response=stanza)
         except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # Lifecycle hooks (reactions)
+    # -----------------------------------------------------------------
+
+    def _reactions_allowed(self, event: MessageEvent) -> bool:
+        if not self._reactions_enabled:
+            return False
+        sender = getattr(getattr(event, "source", None), "user_id", None)
+        if sender and not self.allow_all_users and self.allowed_users:
+            if self._bare(sender) not in self.allowed_users:
+                return False
+        return True
+
+    def _extract_reaction_target(self, event: MessageEvent) -> Optional[str]:
+        return getattr(event, "message_id", None) or None
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        if not self._reactions_allowed(event):
+            return
+        target_id = self._extract_reaction_target(event)
+        if target_id and self.client is not None and "xep_0444" in self._registered_plugins:
+            try:
+                self.client["xep_0444"].send_reactions(
+                    to=JID(event.source.chat_id),
+                    to_id=target_id,
+                    reactions=["👀"],
+                )
+                self._pending_reactions[target_id] = event
+            except Exception:
+                logger.debug("xmpp: failed to send 👀 reaction", exc_info=True)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        if not self._reactions_allowed(event):
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            return
+        target_id = self._extract_reaction_target(event)
+        if not target_id or self.client is None or "xep_0444" not in self._registered_plugins:
+            return
+        try:
+            # Remove in-progress reaction
+            self.client["xep_0444"].send_reactions(
+                to=JID(event.source.chat_id),
+                to_id=target_id,
+                reactions=[],
+            )
+        except Exception:
+            logger.debug("xmpp: failed to remove 👀 reaction", exc_info=True)
+        try:
+            if outcome == ProcessingOutcome.SUCCESS:
+                self.client["xep_0444"].send_reactions(
+                    to=JID(event.source.chat_id),
+                    to_id=target_id,
+                    reactions=["✅"],
+                )
+            elif outcome == ProcessingOutcome.FAILURE:
+                self.client["xep_0444"].send_reactions(
+                    to=JID(event.source.chat_id),
+                    to_id=target_id,
+                    reactions=["❌"],
+                )
+        except Exception:
+            logger.debug("xmpp: failed to send final reaction", exc_info=True)
+        finally:
+            self._pending_reactions.pop(target_id, None)
+
+    # -----------------------------------------------------------------
+    # Clarify via XEP-0004 Data Forms
+    # -----------------------------------------------------------------
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if self.client is None:
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+
+        if not choices or "xep_0004" not in self._registered_plugins:
+            # Fallback to text-based clarify
+            from tools.clarify_gateway import mark_awaiting_text
+            if choices:
+                lines = [f"❓ {question}", ""]
+                for i, choice in enumerate(choices, start=1):
+                    lines.append(f"  {i}. {choice}")
+                lines.append("")
+                lines.append("Reply with the number, the option text, or your own answer.")
+                text = "\n".join(lines)
+                mark_awaiting_text(clarify_id)
+            else:
+                text = f"❓ {question}"
+            return await self.send(chat_id=chat_id, content=text, metadata=metadata)
+
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+        try:
+            form = self.client["xep_0004"].make_form(
+                ftype="form", title=question, instructions="Select an option and submit."
+            )
+            form.add_field(
+                var="clarify_id",
+                ftype="hidden",
+                value=clarify_id,
+            )
+            options = [
+                {"label": str(c), "value": str(c)}
+                for c in (choices or [])
+            ]
+            options.append({"label": "Other (type your own answer)", "value": "__other__"})
+            form.add_field(
+                var="answer",
+                ftype="list-single",
+                label=question,
+                options=options,
+            )
+
+            msg = self.client.make_message(mto=chat_id, mtype=mtype)
+            msg["body"] = question
+            msg["form"] = form
+            msg.send()
+
+            msg_id = None
+            try:
+                msg_id = msg["id"]
+            except Exception:
+                pass
+            return SendResult(success=True, message_id=msg_id, raw_response=msg)
+        except Exception as exc:
+            logger.exception("xmpp: send_clarify with data form failed")
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # Ad-Hoc Commands (XEP-0050)
+    # -----------------------------------------------------------------
+
+    async def _setup_adhoc_commands(self) -> None:
+        if self.client is None or "xep_0050" not in self._registered_plugins:
+            return
+        try:
+            xep_0050 = self.client["xep_0050"]
+            # Register a simple "hermes" command node that lists available actions
+            xep_0050.add_command(
+                jid=self.client.boundjid,
+                node="hermes",
+                name="Hermes Agent Commands",
+                handler=self._adhoc_hermes_handler,
+            )
+        except Exception:
+            logger.debug("xmpp: failed to register ad-hoc commands", exc_info=True)
+
+    async def _adhoc_hermes_handler(self, iq: Any, session: Dict[str, Any]) -> Dict[str, Any]:
+        client = self.client
+        if client is None or "xep_0004" not in self._registered_plugins:
+            session["notes"] = [("error", "Data forms not available")]
+            return session
+        try:
+            form = client["xep_0004"].make_form(
+                ftype="form", title="Hermes Commands", instructions="Choose a command to execute."
+            )
+            form.add_field(
+                var="command",
+                ftype="list-single",
+                label="Command",
+                options=[
+                    {"label": "Status", "value": "status"},
+                    {"label": "Help", "value": "help"},
+                    {"label": "Ping", "value": "ping"},
+                ],
+            )
+            session["payload"] = form
+            session["has_next"] = False
+            session["next"] = None
+            return session
+        except Exception:
+            session["notes"] = [("error", "Failed to build command list")]
+            return session
+
+    # -----------------------------------------------------------------
+    # Voice messages via XEP-0447 SFS
+    # -----------------------------------------------------------------
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        path: str,
+        **kwargs,
+    ) -> SendResult:
+        if self.client is None:
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+        if "xep_0447" not in self._registered_plugins or "xep_0363" not in self._registered_plugins:
+            return await self._upload_and_send(chat_id, path, caption=None)
+
+        content_type, _ = mimetypes.guess_type(path)
+        upload_kwargs: Dict[str, Any] = {
+            "filename": Path(path).name,
+            "input_file": path,
+        }
+        if content_type:
+            upload_kwargs["content_type"] = content_type
+        try:
+            upload = self.client["xep_0363"].upload_file
+            try:
+                url = await upload(**upload_kwargs)
+            except TypeError:
+                upload_kwargs.pop("content_type", None)
+                url = await upload(**upload_kwargs)
+        except Exception as exc:
+            logger.exception("xmpp: HTTP upload for voice failed")
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+        try:
+            sfs = self.client["xep_0447"].get_sfs(
+                path=Path(path),
+                uris=[url],
+                media_type=content_type or "audio/ogg",
+                desc="Voice message",
+                disposition="inline",
+            )
+            msg = self.client.make_message(mto=chat_id, mtype=mtype)
+            msg["body"] = "[Voice message]"
+            msg["sfs"] = sfs
+            msg.send()
+
+            msg_id = None
+            try:
+                msg_id = msg["id"]
+            except Exception:
+                pass
+            return SendResult(success=True, message_id=msg_id, raw_response=msg)
+        except Exception as exc:
+            logger.exception("xmpp: send_voice via SFS failed")
             return SendResult(success=False, error=str(exc), retryable=True)
 
     # -----------------------------------------------------------------
