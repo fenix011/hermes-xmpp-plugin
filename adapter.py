@@ -348,7 +348,14 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             await self.client.disconnected
         except asyncio.CancelledError:
-            pass
+            # slixmpp's event may not yield during disconnect, so force a
+            # disconnect to unblock any internal awaits before the task unwinds.
+            if self.client is not None:
+                try:
+                    self.client.disconnect()
+                except Exception:
+                    pass
+            raise  # re-raise so the task is properly marked cancelled
         except Exception:
             logger.exception("xmpp: process loop crashed")
 
@@ -526,7 +533,7 @@ class XmppAdapter(BasePlatformAdapter):
         formatting: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if self.client is None:
+        if self.client is None or not getattr(self, "_running", True):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
 
         # Forward legacy media params to dedicated methods
@@ -667,14 +674,18 @@ class XmppAdapter(BasePlatformAdapter):
                 pass
             return SendResult(success=True, message_id=msg_id, raw_response=stanza)
 
-        # Explicit Message Encryption (XEP-0380) hint for compatibility
-        try:
-            import oldmemo
-            message["eme"]["namespace"] = oldmemo.oldmemo.NAMESPACE
-            if "xep_0380" in self._registered_plugins:
-                message["eme"]["name"] = client_local["xep_0380"].mechanisms[oldmemo.oldmemo.NAMESPACE]
-        except Exception:
-            pass
+        # Explicit Message Encryption (XEP-0380) hint for compatibility.
+        # Only set it when the plugin is actually registered; without it the
+        # 'eme' interface doesn't exist and accessing it logs an "Unknown
+        # stanza interface" warning per slixmpp.
+        if "xep_0380" in self._registered_plugins:
+            try:
+                import oldmemo
+                ns = oldmemo.oldmemo.NAMESPACE
+                message["eme"]["namespace"] = ns
+                message["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
+            except Exception:
+                pass
 
         message.send()
         msg_id = None
@@ -685,7 +696,7 @@ class XmppAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=msg_id, raw_response=message)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        if self.client is None or "xep_0085" not in self._registered_plugins:
+        if self.client is None or "xep_0085" not in self._registered_plugins or not getattr(self, "_running", True):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
@@ -694,7 +705,7 @@ class XmppAdapter(BasePlatformAdapter):
             logger.debug("xmpp: send_typing failed", exc_info=True)
 
     async def stop_typing(self, chat_id: str) -> None:
-        if self.client is None or "xep_0085" not in self._registered_plugins:
+        if self.client is None or "xep_0085" not in self._registered_plugins or not getattr(self, "_running", True):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
@@ -733,7 +744,7 @@ class XmppAdapter(BasePlatformAdapter):
     async def _upload_and_send(
         self, chat_id: str, path: str, caption: Optional[str]
     ) -> SendResult:
-        if self.client is None:
+        if self.client is None or not getattr(self, "_running", True):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
         if "xep_0363" not in self._registered_plugins:
             return SendResult(
@@ -964,7 +975,7 @@ class XmppAdapter(BasePlatformAdapter):
         path: str,
         **kwargs,
     ) -> SendResult:
-        if self.client is None:
+        if self.client is None or not getattr(self, "_running", True):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
         if "xep_0447" not in self._registered_plugins or "xep_0363" not in self._registered_plugins:
             return await self._upload_and_send(chat_id, path, caption=None)
