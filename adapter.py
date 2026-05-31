@@ -548,6 +548,14 @@ class XmppAdapter(BasePlatformAdapter):
                 )
             else:
                 stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
+            # Attach XEP-0394 markup if available
+            if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
+                try:
+                    markup = self._build_markup(content)
+                    if markup is not None:
+                        stanza.xml.append(markup.xml)
+                except Exception:
+                    logger.debug("xmpp: failed to attach markup", exc_info=True)
             msg_id = None
             try:
                 msg_id = stanza["id"]
@@ -557,6 +565,55 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("xmpp: send failed")
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # XEP-0394 Message Markup helper
+    # -----------------------------------------------------------------
+
+    def _build_markup(
+        self,
+        body: str,
+    ) -> Any:
+        """Return a slixmpp Markup element with basic formatting hints.
+
+        Supports Markdown-lite in body:
+        - **bold** or __bold__ → emphasis
+        - `code` or ``code`` → code span
+        - ```code block``` → block-code
+        """
+        try:
+            from slixmpp.plugins.xep_0394.stanza import Markup, Span, BlockCode, EmphasisType, CodeType
+        except ImportError:
+            return None
+        markup = Markup(parent=None)
+        spans: List[Any] = []
+        import re
+        for m in re.finditer(r'\*\*(.+?)\*\*|__(.+?)__', body, re.DOTALL):
+            start = m.start()
+            end = m.end()
+            span = Span(parent=markup)
+            span["start"] = start
+            span["end"] = end
+            span.xml.append(EmphasisType(parent=span).xml)
+            spans.append(span)
+        for m in re.finditer(r'`{1,2}([^`]+)`{1,2}', body, re.DOTALL):
+            start = m.start()
+            end = m.end()
+            span = Span(parent=markup)
+            span["start"] = start
+            span["end"] = end
+            span.xml.append(CodeType(parent=span).xml)
+            spans.append(span)
+        for m in re.finditer(r'```(.+?)```', body, re.DOTALL):
+            start = m.start()
+            end = m.end()
+            bcode = BlockCode(parent=markup)
+            bcode["start"] = start
+            bcode["end"] = end
+            spans.append(bcode)
+        for s in spans:
+            markup.xml.append(s.xml)
+        return markup if spans else None
 
     async def _send_encrypted(self, chat_id: str, content: str) -> SendResult:
         """Send an OMEMO-encrypted 1:1 chat message."""
