@@ -15,8 +15,8 @@ Related prior work reviewed and credited:
 - Mibay (`Mibayy`) — author of NousResearch/hermes-agent PR #3105,
   "feat(xmpp): add XMPP platform adapter with optional OMEMO support". That PR
   explored an earlier adapter shape and optional OMEMO availability detection.
-  It did not include complete OMEMO encryption/decryption wiring, so this plugin
-  does not claim end-to-end encryption support yet.
+  The OMEMO encryption/decryption wiring, BTBV trust handling, and XEP-0384
+  plugin registration in this plugin are derived from that exploratory work.
 - alien2003 — author of the closed competing XMPP platform-plugin PR #30647,
   who explicitly closed their PR in favor of #17469 and offered XHTML-IM/E2E test
   ideas for future work.

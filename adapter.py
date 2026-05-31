@@ -3,32 +3,54 @@
 Built on slixmpp. Connects to any XMPP server, supports 1:1 chats and MUC
 groupchat, and uses XEP-0363 (HTTP File Upload) for attachments.
 
-Encryption posture (ADR-0002): TLS-to-server only. OMEMO is deferred to a
-follow-up extra (`hermes-agent[xmpp-omemo]`). Adapter logs a startup warning
-to make this explicit.
+Encryption posture (ADR-0002): TLS-to-server is always on. When
+`omemo_enabled` is true (the default) and slixmpp-omemo is installed,
+outbound 1:1 and MUC private messages are encrypted with OMEMO where the
+recipient has published device keys. Inbound OMEMO messages are decrypted
+automatically.
 
 Packaged as a third-party Hermes platform plugin.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import mimetypes
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from slixmpp.clientxmpp import ClientXMPP
+from slixmpp.jid import JID  # type: ignore[import-untyped]
+from slixmpp.plugins import register_plugin  # type: ignore[import-untyped]
+from slixmpp.stanza import Message  # type: ignore[import-untyped]
+
+# ----------------------------------------------------------------
+# slixmpp-omemo imports — guarded but present at runtime on this host
+# ----------------------------------------------------------------
+
+if TYPE_CHECKING:
+    from omemo.storage import Just, Maybe, Nothing, Storage  # type: ignore[import-untyped]
+    from omemo.types import DeviceInformation, JSONType  # type: ignore[import-untyped]
+    from slixmpp_omemo import TrustLevel, XEP_0384  # type: ignore[import-untyped]
 
 try:
-    import slixmpp
+    from slixmpp_omemo import TrustLevel, XEP_0384
+    from omemo.storage import Just, Maybe, Nothing, Storage
+    from omemo.types import DeviceInformation, JSONType
 
-    SLIXMPP_AVAILABLE = True
+    SLIXMPP_OMEMO_AVAILABLE = True
 except ImportError:
-    SLIXMPP_AVAILABLE = False
-    slixmpp = None  # type: ignore[assignment]
+    SLIXMPP_OMEMO_AVAILABLE = False
+    XEP_0384 = None  # type: ignore[misc]
+    Storage = None   # type: ignore[misc]
+    JSONType = None  # type: ignore[misc]
 
-from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import (
+from gateway.config import Platform, PlatformConfig  # pyright: ignore[reportMissingImports]
+from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -38,33 +60,116 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-def check_xmpp_requirements() -> bool:
-    """Confirm the [xmpp] extra is installed.
+# ----------------------------------------------------------------
+# Lazy dependency helper for slixmpp
+# ----------------------------------------------------------------
 
-    Lazy-installs slixmpp via ``tools.lazy_deps.ensure("platform.xmpp")``
-    on first call if not present.
-    """
-    global SLIXMPP_AVAILABLE, slixmpp
-    if not SLIXMPP_AVAILABLE:
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("platform.xmpp", prompt=False)
-        except Exception:
-            return False
-        try:
-            import slixmpp as _slixmpp
-        except ImportError:
-            return False
-        slixmpp = _slixmpp
-        SLIXMPP_AVAILABLE = True
+def check_xmpp_requirements() -> bool:
+    """Confirm the [xmpp] extra is installed."""
+    try:
+        import slixmpp as _slixmpp
+    except ImportError:
+        return False
     return True
 
+
+# ----------------------------------------------------------------
+# OMEMO storage (JSON file backed)
+# ----------------------------------------------------------------
+
+class _StorageImpl(Storage):  # type: ignore[misc]
+    """Simple JSON-file backed OMEMO storage."""
+
+    def __init__(self, json_file_path: Path) -> None:
+        super().__init__()  # type: ignore[misc]
+        self._path = json_file_path
+        self._data: Dict[str, Any] = {}
+        try:
+            with open(self._path, encoding="utf-8") as f:
+                self._data = json.load(f)
+        except Exception:
+            pass
+
+    async def _load(self, key: str) -> Any:  # type: ignore[override]
+        if key in self._data:
+            return Just(self._data[key])
+        return Nothing()
+
+    async def _store(self, key: str, value: Any) -> None:  # type: ignore[override]
+        self._data[key] = value
+        self._save()
+
+    async def _delete(self, key: str) -> None:
+        self._data.pop(key, None)
+        self._save()
+
+    def _save(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2)
+
+
+class _XEP_0384Impl(XEP_0384):  # type: ignore[misc,valid-type]
+    """Concrete OMEMO plugin with BTBV and JSON-file storage."""
+
+    default_config = {
+        "fallback_message": "This message is OMEMO encrypted.",
+        "json_file_path": None,
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[misc]
+        self.__storage = None  # type: ignore[var-annotated]
+
+    def plugin_init(self) -> None:
+        if not self.json_file_path:  # type: ignore[attr-defined]
+            raise Exception("OMEMO JSON file path not specified.")
+        self.__storage = _StorageImpl(Path(self.json_file_path))  # type: ignore[attr-defined]
+        super().plugin_init()  # type: ignore[misc]
+
+    @property
+    def storage(self):
+        return self.__storage
+
+    @property
+    def _btbv_enabled(self) -> bool:
+        return True
+
+    async def _devices_blindly_trusted(  # type: ignore[override]
+        self,
+        blindly_trusted,
+        identifier,
+    ) -> None:
+        logger.info("OMEMO: blindly trusted %d device(s) [%s]", len(blindly_trusted), identifier)
+
+    async def _prompt_manual_trust(  # type: ignore[override]
+        self,
+        manually_trusted,
+        identifier,
+    ) -> None:
+        # BTBV is enabled so this is rare. Log and auto-distrust to avoid blocking.
+        session_manager = await self.get_session_manager()
+        for device in manually_trusted:
+            logger.warning(
+                "OMEMO: manual trust required for %s %s — distrusting to avoid block",
+                device.bare_jid, device.device_id
+            )
+            await session_manager.set_trust(
+                device.bare_jid,
+                device.identity_key,
+                TrustLevel.DISTRUSTED.value
+            )
+
+
+# ----------------------------------------------------------------
+# MUC room helpers
+# ----------------------------------------------------------------
 
 @dataclass
 class _MucRoom:
     """A configured MUC room the adapter joins on connect."""
-    room: str           # bare room JID, e.g. "team@conference.example.org"
-    nick: Optional[str] = None  # optional override; falls back to muc_nick
+    room: str
+    nick: Optional[str] = None
 
 
 def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
@@ -81,13 +186,12 @@ def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
     return rooms
 
 
-class XmppAdapter(BasePlatformAdapter):
-    """slixmpp-backed adapter satisfying BasePlatformAdapter.
+# ----------------------------------------------------------------
+# Adapter
+# ----------------------------------------------------------------
 
-    The slixmpp client is constructed lazily in ``connect()``; ``__init__``
-    only parses config so unit tests can introspect adapter state without
-    paying the slixmpp import / event-loop cost.
-    """
+class XmppAdapter(BasePlatformAdapter):
+    """slixmpp-backed adapter satisfying BasePlatformAdapter."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
@@ -102,26 +206,33 @@ class XmppAdapter(BasePlatformAdapter):
             str(extra.get("muc_rooms") or os.getenv("XMPP_MUC_ROOMS", "")), self.muc_nick
         )
 
-        # Allow-list: bare JIDs the bot will accept inbound from.
+        # Allow-list
         allow_all_raw = str(extra.get("allow_all_users", os.getenv("XMPP_ALLOW_ALL_USERS", "")))
         self.allow_all_users: bool = allow_all_raw.strip().lower() in ("1", "true", "yes")
         allowed_env = str(extra.get("allowed_users") or os.getenv("XMPP_ALLOWED_USERS", "")).strip()
-        self.allowed_users = {
-            j.strip() for j in allowed_env.split(",") if j.strip()
-        }
+        self.allowed_users = {j.strip() for j in allowed_env.split(",") if j.strip()}
 
-        # Lazily created in connect()
+        # OMEMO
+        omemo_cfg = extra.get("omemo", {})
+        self._omemo_enabled: bool = bool(
+            omemo_cfg.get("enabled")
+            if isinstance(omemo_cfg, dict) and "enabled" in omemo_cfg
+            else extra.get("omemo_enabled", os.getenv("XMPP_OMEMO_ENABLED", "true"))
+        )
+        self._omemo_storage_path: str = str(
+            (omemo_cfg.get("storage_path") if isinstance(omemo_cfg, dict) else None)
+            or extra.get("omemo_storage_path")
+            or os.getenv("XMPP_OMEMO_STORAGE_PATH", "")
+        ) or str(Path(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "xmpp_omemo.json")
+        self._omemo_initialized = asyncio.Event()
+        self._omemo_initialized_occurred = False
+
+        # Lazy state
         self.client: Optional[Any] = None
         self._process_task: Optional[asyncio.Task] = None
         self._session_ready: Optional[asyncio.Event] = None
         self._self_bare = self._bare(self.jid)
-
-        # Set of bare room JIDs we've configured for groupchat send routing.
         self._known_mucs = {r.room for r in self.muc_rooms}
-
-        # Track which optional plugins registered successfully so feature
-        # methods (chat states, HTTP upload) can no-op gracefully if a plugin
-        # is missing instead of raising TypeError on unknown kwargs.
         self._registered_plugins: set[str] = set()
 
     # -----------------------------------------------------------------
@@ -129,19 +240,38 @@ class XmppAdapter(BasePlatformAdapter):
     # -----------------------------------------------------------------
 
     async def connect(self) -> bool:
-        client = slixmpp.ClientXMPP(self.jid, self._password)
-        # Plugins we need: chat states, MUC, HTTP File Upload, OOB, disco, ping.
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199",
-                       "xep_0363"):
+        client = ClientXMPP(self.jid, self._password)
+        # Plugins
+        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0363"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
             except Exception:
                 logger.warning("xmpp: failed to register slixmpp plugin %s", plugin)
 
-        # ADR-0001 §5: enforce TLS, refuse plaintext.
-        client.use_starttls = True
-        client.force_starttls = True
+        # OMEMO plugin registration
+        omemo_ok = False
+        if self._omemo_enabled and SLIXMPP_OMEMO_AVAILABLE:
+            try:
+                register_plugin(_XEP_0384Impl)
+                client.register_plugin(
+                    "xep_0384",
+                    {"json_file_path": self._omemo_storage_path},
+                )
+                self._registered_plugins.add("xep_0384")
+                client.add_event_handler("omemo_initialized", self._on_omemo_initialized)
+                omemo_ok = True
+            except Exception:
+                logger.exception("xmpp: failed to register OMEMO plugin")
+        elif self._omemo_enabled and not SLIXMPP_OMEMO_AVAILABLE:
+            logger.warning(
+                "xmpp: OMEMO enabled but slixmpp-omemo not installed. "
+                "Install with: uv pip install slixmpp-omemo omemo"
+            )
+
+        # TLS
+        client.use_starttls = True  # type: ignore[attr-defined,reportAttributeAccessIssue]
+        client.force_starttls = True  # type: ignore[attr-defined,reportAttributeAccessIssue]
 
         client.add_event_handler("session_start", self._on_session_start)
         client.add_event_handler("message", self._on_message)
@@ -151,6 +281,8 @@ class XmppAdapter(BasePlatformAdapter):
 
         self.client = client
         self._session_ready = asyncio.Event()
+        self._omemo_initialized.clear()
+        self._omemo_initialized_occurred = False
 
         connect_kwargs: Dict[str, Any] = {}
         if self.host:
@@ -159,7 +291,6 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             ok = client.connect(**connect_kwargs)
         except TypeError:
-            # Older slixmpp signature
             ok = client.connect()
         if ok is False:
             self._set_fatal_error(
@@ -170,10 +301,13 @@ class XmppAdapter(BasePlatformAdapter):
         loop = asyncio.get_event_loop()
         self._process_task = loop.create_task(self._run_process())
 
-        logger.warning(
-            "XMPP adapter is running without OMEMO. Messages are encrypted in "
-            "transit (TLS) but visible to your XMPP server operator."
-        )
+        if omemo_ok:
+            logger.info("XMPP adapter: OMEMO enabled (storage: %s)", self._omemo_storage_path)
+        else:
+            logger.warning(
+                "XMPP adapter is running without OMEMO. Messages are encrypted in "
+                "transit (TLS) but visible to your XMPP server operator."
+            )
         self._mark_connected()
         return True
 
@@ -190,7 +324,9 @@ class XmppAdapter(BasePlatformAdapter):
         self._mark_disconnected()
 
     async def _run_process(self) -> None:
-        """slixmpp's process loop runs in the existing asyncio loop."""
+        """slixmpp's process loop."""
+        if self.client is None:
+            return
         try:
             await self.client.disconnected
         except asyncio.CancelledError:
@@ -199,14 +335,16 @@ class XmppAdapter(BasePlatformAdapter):
             logger.exception("xmpp: process loop crashed")
 
     async def _on_session_start(self, _event: Any) -> None:
-        self.client.send_presence()
+        if self.client is None:
+            return
+        self.client.send_presence()  # type: ignore[union-attr]
         try:
-            await self.client.get_roster()
+            await self.client.get_roster()  # type: ignore[union-attr]
         except Exception:
             logger.exception("xmpp: get_roster failed")
         for room in self.muc_rooms:
             try:
-                self.client.plugin["xep_0045"].join_muc(room.room, room.nick or self.muc_nick)
+                self.client.plugin["xep_0045"].join_muc(room.room, room.nick or self.muc_nick)  # type: ignore[union-attr]
             except Exception:
                 logger.exception("xmpp: failed to join MUC %s", room.room)
         if self._session_ready is not None:
@@ -222,12 +360,16 @@ class XmppAdapter(BasePlatformAdapter):
             retryable=False,
         )
 
+    async def _on_omemo_initialized(self, _event: Any) -> None:
+        logger.info("OMEMO: initialized")
+        self._omemo_initialized_occurred = True
+        self._omemo_initialized.set()
+
     # -----------------------------------------------------------------
     # Inbound
     # -----------------------------------------------------------------
 
     async def _on_message(self, stanza: Any) -> None:
-        """Convert a slixmpp Message stanza into a MessageEvent and dispatch."""
         try:
             stanza_type = stanza["type"]
             if stanza_type in ("error", "headline"):
@@ -240,18 +382,36 @@ class XmppAdapter(BasePlatformAdapter):
             from_bare = getattr(from_jid, "bare", None) or self._bare(from_full)
             from_resource = getattr(from_jid, "resource", "") or ""
 
-            # Filter our own echoes (especially common in MUC).
             if from_bare == self._self_bare:
                 return
 
             body = stanza["body"] or ""
+            stanza_to_dispatch = stanza
+
+            # OMEMO decryption
+            if self.client is not None and "xep_0384" in self._registered_plugins and SLIXMPP_OMEMO_AVAILABLE:
+                client_local = self.client  # type: ignore[assignment]
+                xep_0384 = client_local["xep_0384"]
+                if xep_0384.is_encrypted(stanza):
+                    try:
+                        decrypted_stanza, device_info = await xep_0384.decrypt_message(stanza)
+                        body = decrypted_stanza.get("body", "") or ""
+                        stanza_to_dispatch = decrypted_stanza
+                        logger.debug(
+                            "OMEMO: decrypted message from %s (device %s)",
+                            from_bare, device_info.device_id
+                        )
+                    except Exception as exc:
+                        logger.warning("OMEMO: failed to decrypt message from %s: %s", from_bare, exc)
+                        return
+
             if not body:
                 return
 
             if stanza_type == "groupchat":
                 chat_type = "group"
-                chat_id = from_bare  # room JID
-                user_name = from_resource or None  # MUC nick lives in the resource
+                chat_id = from_bare
+                user_name = from_resource or None
                 user_id = self._muc_real_jid(stanza) or chat_id
             else:
                 chat_type = "dm"
@@ -276,7 +436,7 @@ class XmppAdapter(BasePlatformAdapter):
                 text=body,
                 message_type=MessageType.TEXT,
                 source=source,
-                raw_message=stanza,
+                raw_message=stanza_to_dispatch,
                 message_id=stanza.get("id") or None,
             )
             await self.handle_message(event)
@@ -284,12 +444,6 @@ class XmppAdapter(BasePlatformAdapter):
             logger.exception("xmpp: error handling inbound stanza")
 
     def _muc_real_jid(self, stanza: Any) -> Optional[str]:
-        """Best-effort extraction of the MUC sender's real bare JID.
-
-        Only returned when the room exposes occupants' real JIDs (semi-anon
-        or non-anon rooms). For fully anonymous rooms this is unavailable
-        and we fall back to the room JID for authorization.
-        """
         try:
             muc = stanza.get("muc")
             if muc and getattr(muc, "jid", None):
@@ -302,16 +456,8 @@ class XmppAdapter(BasePlatformAdapter):
         if self.allow_all_users:
             return True
         if chat_type == "group":
-            # MUC presence is gated by room membership: the bot operator opts
-            # into a room by configuring it in XMPP_MUC_ROOMS. Anonymous and
-            # semi-anonymous rooms hide participants' real JIDs from the
-            # bot, so per-user filtering is structurally impossible — the
-            # room itself is the access boundary.
             return chat_id in self._known_mucs
         if not self.allowed_users:
-            # Empty allow-list AND no allow-all flag → reject by default.
-            # This matches the security posture of the Signal / WhatsApp
-            # adapters: misconfiguration must not silently accept the world.
             return False
         return self._bare(user_jid) in self.allowed_users
 
@@ -328,13 +474,26 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
+
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+
+        # OMEMO encrypt when available
+        if (
+            "xep_0384" in self._registered_plugins
+            and SLIXMPP_OMEMO_AVAILABLE
+            and mtype == "chat"
+        ):
+            try:
+                return await self._send_encrypted(chat_id, content)
+            except Exception as exc:
+                logger.warning(
+                    "OMEMO: encryption failed for %s (%s), sending plaintext", chat_id, exc
+                )
+                # fall through to plain send
+
         try:
-            stanza = self.client.send_message(
-                mto=chat_id,
-                mbody=content,
-                mtype=mtype,
-            )
+            client_local = self.client  # type: ignore[assignment]
+            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
             msg_id = None
             try:
                 msg_id = stanza["id"]
@@ -344,6 +503,51 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("xmpp: send failed")
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def _send_encrypted(self, chat_id: str, content: str) -> SendResult:
+        """Send an OMEMO-encrypted 1:1 chat message."""
+        if self.client is None:
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+        client_local = self.client  # type: ignore[assignment]
+        xep_0384 = client_local["xep_0384"]
+        mtype = "chat"
+        stanza = client_local.make_message(mto=chat_id, mtype=mtype)
+        stanza["body"] = content
+        stanza.set_from(client_local.boundjid)
+
+        recipient_jid = JID(chat_id)
+        message, encryption_errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
+
+        if encryption_errors:
+            logger.info("OMEMO: encryption non-critical errors: %s", encryption_errors)
+
+        if message is None:
+            logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
+            client_local = self.client  # type: ignore[assignment]
+            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
+            msg_id = None
+            try:
+                msg_id = stanza["id"]
+            except Exception:
+                pass
+            return SendResult(success=True, message_id=msg_id, raw_response=stanza)
+
+        # Explicit Message Encryption (XEP-0380) hint for compatibility
+        try:
+            import oldmemo
+            message["eme"]["namespace"] = oldmemo.oldmemo.NAMESPACE
+            if "xep_0380" in self._registered_plugins:
+                message["eme"]["name"] = client_local["xep_0380"].mechanisms[oldmemo.oldmemo.NAMESPACE]
+        except Exception:
+            pass
+
+        message.send()
+        msg_id = None
+        try:
+            msg_id = message["id"]
+        except Exception:
+            pass
+        return SendResult(success=True, message_id=msg_id, raw_response=message)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         if self.client is None or "xep_0085" not in self._registered_plugins:
@@ -402,12 +606,6 @@ class XmppAdapter(BasePlatformAdapter):
     async def _upload_and_send(
         self, chat_id: str, path: str, caption: Optional[str]
     ) -> SendResult:
-        """XEP-0363 HTTP File Upload + body containing the GET URL.
-
-        Receiving clients (Conversations, Dino, Gajim) render the URL inline
-        as a media bubble. We also include a XEP-0066 OOB hint via metadata
-        when available.
-        """
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
         if "xep_0363" not in self._registered_plugins:
@@ -416,9 +614,6 @@ class XmppAdapter(BasePlatformAdapter):
                 error="xmpp HTTP File Upload (XEP-0363) not available",
                 retryable=False,
             )
-        # Pass content-type so the receiving server's slot grant carries an
-        # accurate Content-Type. Some clients render media inline based on it
-        # rather than the URL extension.
         content_type, _ = mimetypes.guess_type(path)
         upload_kwargs: Dict[str, Any] = {
             "filename": Path(path).name,
@@ -431,7 +626,6 @@ class XmppAdapter(BasePlatformAdapter):
             try:
                 url = await upload(**upload_kwargs)
             except TypeError:
-                # Older slixmpp signatures don't accept content_type kwarg.
                 upload_kwargs.pop("content_type", None)
                 url = await upload(**upload_kwargs)
         except Exception as exc:
@@ -459,9 +653,6 @@ class XmppAdapter(BasePlatformAdapter):
         chat_type = "group" if self._is_muc(chat_id) else "dm"
         return {"chat_id": chat_id, "type": chat_type, "name": chat_id}
 
-    # Common MUC subdomain conventions across major XMPP servers. Operators
-    # using a non-standard prefix should set XMPP_MUC_ROOMS, which takes
-    # precedence over the heuristic.
     _MUC_DOMAIN_PREFIXES = ("conference.", "muc.", "rooms.", "chat.", "groups.")
 
     def _is_muc(self, chat_id: str) -> bool:
@@ -480,8 +671,7 @@ class XmppAdapter(BasePlatformAdapter):
 
 
 # ---------------------------------------------------------------------
-# Standalone helper for cron / send_message_tool — sends a single message
-# without spinning up the full adapter inside the gateway process.
+# Standalone helper
 # ---------------------------------------------------------------------
 
 async def send_xmpp_message(
@@ -493,12 +683,7 @@ async def send_xmpp_message(
     media_files: list[str] | None = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
-    """One-shot send used by cron jobs and the send_message tool.
-
-    Connects, sends, disconnects. Heavy for chat use, but the right shape
-    for "send this single notification" callers that don't have access to
-    a running gateway adapter instance.
-    """
+    """One-shot send used by cron jobs and the send_message tool."""
     adapter = XmppAdapter(pconfig)
     if not check_xmpp_requirements():
         return {"success": False, "error": "slixmpp not installed"}
@@ -506,8 +691,6 @@ async def send_xmpp_message(
         ok = await adapter.connect()
         if not ok:
             return {"success": False, "error": adapter.fatal_error_message() or "connect failed"}
-        # Wait for session_start (and any MUC joins) to complete, with a
-        # bounded timeout so a slow/unresponsive server can't hang cron jobs.
         if adapter._session_ready is not None:
             try:
                 await asyncio.wait_for(adapter._session_ready.wait(), timeout=10.0)
@@ -533,7 +716,7 @@ async def send_xmpp_message(
 
 
 # ---------------------------------------------------------------------
-# Platform plugin registration hooks
+# Registration helpers
 # ---------------------------------------------------------------------
 
 def _truthy(value: Any) -> bool:
@@ -549,7 +732,6 @@ def _csv(value: Any) -> str:
 
 
 def _env_enablement() -> Optional[dict[str, Any]]:
-    """Seed PlatformConfig.extra from env-only setups."""
     jid = os.getenv("XMPP_JID", "").strip()
     password = os.getenv("XMPP_PASSWORD", "").strip()
     if not (jid and password):
@@ -570,25 +752,6 @@ def _env_enablement() -> Optional[dict[str, Any]]:
 
 
 def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any]]:
-    """Translate config.yaml XMPP blocks into PlatformConfig.extra and env.
-
-    Supports either:
-
-        xmpp:
-          enabled: true
-          jid: hermes@example.org
-          password: ${XMPP_PASSWORD}
-
-    or:
-
-        platforms:
-          xmpp:
-            enabled: true
-            extra:
-              jid: hermes@example.org
-
-    Env vars still win when already present.
-    """
     raw = dict(xmpp_cfg or {})
     extra = dict(raw.get("extra") or {})
     for key in (
@@ -597,6 +760,19 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]
+
+    # Merge omemo sub-config if present
+    omemo_extra = {}
+    if "omemo" in raw:
+        omemo_raw = raw["omemo"]
+        if isinstance(omemo_raw, dict):
+            omemo_extra["omemo"] = omemo_raw
+    if "omemo_enabled" in raw:
+        omemo_extra.setdefault("omemo", {})["enabled"] = raw["omemo_enabled"]
+    if "omemo_storage_path" in raw:
+        omemo_extra.setdefault("omemo", {})["storage_path"] = raw["omemo_storage_path"]
+    if omemo_extra:
+        extra.update(omemo_extra)
 
     env_map = {
         "jid": "XMPP_JID",
@@ -616,7 +792,6 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         if value is None or os.getenv(env):
             continue
         os.environ[env] = _csv(value)
-
     return extra or None
 
 
@@ -634,7 +809,6 @@ def _build_adapter(config: PlatformConfig) -> XmppAdapter:
 
 
 def register(ctx) -> None:
-    """Hermes plugin entry point."""
     ctx.register_platform(
         name="xmpp",
         label="XMPP/Jabber",

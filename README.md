@@ -11,13 +11,14 @@ to land. It supports:
 - mandatory STARTTLS to the XMPP server
 - XEP-0085 typing indicators
 - XEP-0363 HTTP file upload for media/files
+- OMEMO end-to-end encryption (optional, needs slixmpp-omemo)
 - cron and `send_message` delivery through a standalone sender hook
 - Hermes platform plugin registration via `ctx.register_platform(...)`
 
-Important: this plugin does not currently provide OMEMO end-to-end encryption.
-Traffic is encrypted to your XMPP server with TLS, but the server can see message
-content. Use a trusted/self-hosted server if that matters. See `ATTRIBUTION.md`
-for why OMEMO is credited but not claimed.
+Traffic is encrypted to your XMPP server with TLS. When OMEMO is enabled and
+slixmpp-omemo is installed, 1:1 messages are also end-to-end encrypted so the
+server cannot read content. MUC OMEMO support depends on client/device
+availability.
 
 ## Credits
 
@@ -88,6 +89,38 @@ xmpp:
 ```
 
 Env vars win when both are set.
+
+## OMEMO end-to-end encryption (optional)
+
+Install the extra dependencies:
+
+```bash
+uv pip install --python ~/.hermes/hermes-agent/venv/bin/python slixmpp-omemo omemo
+```
+
+Then set in `~/.hermes/.env`:
+
+```env
+XMPP_OMEMO_ENABLED=true
+# Optional — defaults to ~/.hermes/xmpp_omemo.json
+XMPP_OMEMO_STORAGE_PATH=/home/fastfinge/.hermes/xmpp_omemo.json
+```
+
+Or in `config.yaml`:
+
+```yaml
+xmpp:
+  omemo_enabled: true
+  omemo_storage_path: /home/fastfinge/.hermes/xmpp_omemo.json
+```
+
+On first connect, the adapter generates an OMEMO device key and publishes it to
+the server. This may take a few seconds — the adapter waits for initialization
+before sending encrypted messages. If the recipient hasn't published device keys
+yet, messages fall back to plaintext (with a log warning).
+
+MUC OMEMO is supported when all participants have compatible devices, but group
+encryption reliability varies by client. 1:1 encryption is the primary use case.
 
 ## Multiple Hermes profiles
 

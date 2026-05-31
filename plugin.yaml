@@ -1,7 +1,7 @@
 name: hermes-xmpp-plugin
 label: XMPP/Jabber
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   Third-party XMPP/Jabber gateway platform plugin for Hermes Agent. Supports
   1:1 chat, MUC rooms, typing indicators, mandatory STARTTLS, and XEP-0363
@@ -44,4 +44,12 @@ optional_env:
   - name: XMPP_HOME_CHANNEL
     description: Default JID or room for cron / send_message delivery
     prompt: XMPP home channel
+    password: false
+  - name: XMPP_OMEMO_ENABLED
+    description: Enable OMEMO E2E encryption (requires slixmpp-omemo)
+    prompt: Enable OMEMO? true/false
+    password: false
+  - name: XMPP_OMEMO_STORAGE_PATH
+    description: Path to OMEMO device key JSON storage
+    prompt: OMEMO storage path
     password: false
