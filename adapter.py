@@ -536,7 +536,18 @@ class XmppAdapter(BasePlatformAdapter):
 
         try:
             client_local = self.client  # type: ignore[assignment]
-            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
+            # Use XEP-0461 reply if reply_to is provided and plugin is available
+            if reply_to and "xep_0461" in self._registered_plugins:
+                stanza = client_local.make_message(mto=chat_id, mtype=mtype)
+                stanza["body"] = content
+                client_local["xep_0461"].send_reply(
+                    to=JID(chat_id),
+                    to_id=reply_to,
+                    body=content,
+                    msg=stanza,
+                )
+            else:
+                stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
             msg_id = None
             try:
                 msg_id = stanza["id"]
