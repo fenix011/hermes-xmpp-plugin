@@ -11,6 +11,12 @@ to land. It supports:
 - mandatory STARTTLS to the XMPP server
 - XEP-0085 typing indicators
 - XEP-0363 HTTP file upload for media/files
+- XEP-0004 data forms (e.g., clarify prompts)
+- XEP-0050 ad-hoc commands
+- XEP-0394 message markup (bold, code, lists)
+- XEP-0461 threaded message replies
+- XEP-0444 message reactions (e.g., 👀/✅/❌ for processing status)
+- XEP-0447 stateless file sharing for voice messages
 - OMEMO end-to-end encryption (optional, needs slixmpp-omemo)
 - cron and `send_message` delivery through a standalone sender hook
 - Hermes platform plugin registration via `ctx.register_platform(...)`
@@ -134,15 +140,21 @@ Each Hermes profile gets its own `.env`, memory, sessions, and gateway process.
 
 ## Server notes
 
-Prosody needs modules for MUC and HTTP file upload. On Debian/Ubuntu:
+Prosody needs modules for MUC, HTTP file upload, and the new XEPs. On Debian/Ubuntu:
 
 ```bash
 sudo apt install prosody
 sudo prosodyctl adduser hermes@example.org
 ```
 
-Enable/configure `muc` and `http_file_share` in Prosody for group rooms and file
-upload. ejabberd users want MUC plus `mod_http_upload`.
+Enable/configure in Prosody:
+- `muc` — group rooms
+- `http_file_share` — file upload (XEP-0363)
+- `mod_groups` — optional, for ad-hoc command roster
+
+For ejabberd, enable MUC plus `mod_http_upload`. The new features (reactions,
+replies, markup) use standard XMPP stanzas and should work on any modern server
+supporting XEP-0444, XEP-0461, and XEP-0394.
 
 ## Troubleshooting
 
@@ -152,9 +164,67 @@ upload. ejabberd users want MUC plus `mod_http_upload`.
 - DM rejected: add your bare JID to `XMPP_ALLOWED_USERS`.
 - MUC silent: add room to `XMPP_MUC_ROOMS` and invite the bot.
 
+## Features in depth
+
+### Message reactions (XEP-0444)
+
+When Hermes starts processing a request, the adapter sends a 👀 reaction. When it
+finishes, ✅ or ❌ is sent depending on success or error. Reactions are visible in
+clients that support XEP-0444 (Conversations, Dino, Gajim, etc.).
+
+Reactions can also be sent by Hermes tools; the adapter maps the reaction to the
+original message using slixmpp's `xep_0444`.
+
+### Threaded replies (XEP-0461)
+
+When you reply to a bot message, the adapter tracks the thread using XEP-0461
+message references. Replies from Hermes are sent back into the same thread so
+context is preserved.
+
+### Message markup (XEP-0394)
+
+Markdown-like syntax in Hermes responses is converted to XEP-0394 message markup:
+- `**bold**` → `<span style="font-weight: bold">bold</span>
+- `` `code` `` → `<code>code</code>
+- `` ```block``` `` → `<blockcode>block</blockcode>
+  
+Clients that support XEP-0394 render this natively. Others get the raw text.
+
+### Data forms (XEP-0004) for clarify
+
+When Hermes needs clarification, the adapter sends an XEP-0004 data form instead
+of a plain text list. The form includes:
+- A hidden `clarify_id` field
+- A list-single choice field with the available options
+
+Users pick one option and submit it. The adapter reads the form response and
+forwards it back to Hermes.
+
+### Voice messages (XEP-0447)
+
+Voice messages from Hermes are sent as XEP-0447 Stateless File Sharing (SFS)
+messages. The file is uploaded via XEP-0363 HTTP upload first, then a lightweight
+SFS reference is sent. This allows clients to preview metadata before downloading.
+
+Voice calls (Jingle) are not yet supported because slixmpp does not include a
+Jingle RTP implementation.
+
+### Ad-hoc commands (XEP-0050)
+
+The adapter registers ad-hoc commands on the bot's JID. Users can discover them
+with their client's command list (e.g., `/cmd` in Conversations). Currently a
+basic command list is exposed; future releases may add Hermes-specific commands.
+
 ## Development
 
-Run lightweight tests against a Hermes checkout:
+The test suite runs standalone — no Hermes checkout required. It uses mocks for the
+Hermes gateway and slixmpp internals.
+
+```bash
+python -m pytest -q
+```
+
+For testing against a real Hermes checkout, set `PYTHONPATH`:
 
 ```bash
 PYTHONPATH=/path/to/hermes-agent python -m pytest -q

@@ -78,89 +78,92 @@ def check_xmpp_requirements() -> bool:
 # OMEMO storage (JSON file backed)
 # ----------------------------------------------------------------
 
-class _StorageImpl(Storage):  # type: ignore[misc]
-    """Simple JSON-file backed OMEMO storage."""
+if SLIXMPP_OMEMO_AVAILABLE:
+    class _StorageImpl(Storage):  # type: ignore[misc]
+        """Simple JSON-file backed OMEMO storage."""
 
-    def __init__(self, json_file_path: Path) -> None:
-        super().__init__()  # type: ignore[misc]
-        self._path = json_file_path
-        self._data: Dict[str, Any] = {}
-        try:
-            with open(self._path, encoding="utf-8") as f:
-                self._data = json.load(f)
-        except Exception:
-            pass
+        def __init__(self, json_file_path: Path) -> None:
+            super().__init__()  # type: ignore[misc]
+            self._path = json_file_path
+            self._data: Dict[str, Any] = {}
+            try:
+                with open(self._path, encoding="utf-8") as f:
+                    self._data = json.load(f)
+            except Exception:
+                pass
 
-    async def _load(self, key: str) -> Any:  # type: ignore[override]
-        if key in self._data:
-            return Just(self._data[key])
-        return Nothing()
+        async def _load(self, key: str) -> Any:  # type: ignore[override]
+            if key in self._data:
+                return Just(self._data[key])
+            return Nothing()
 
-    async def _store(self, key: str, value: Any) -> None:  # type: ignore[override]
-        self._data[key] = value
-        self._save()
+        async def _store(self, key: str, value: Any) -> None:  # type: ignore[override]
+            self._data[key] = value
+            self._save()
 
-    async def _delete(self, key: str) -> None:
-        self._data.pop(key, None)
-        self._save()
+        async def _delete(self, key: str) -> None:
+            self._data.pop(key, None)
+            self._save()
 
-    def _save(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, indent=2)
+        def _save(self) -> None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
 
+    class _XEP_0384Impl(XEP_0384):  # type: ignore[misc,valid-type]
+        """Concrete OMEMO plugin with BTBV and JSON-file storage."""
 
-class _XEP_0384Impl(XEP_0384):  # type: ignore[misc,valid-type]
-    """Concrete OMEMO plugin with BTBV and JSON-file storage."""
+        default_config = {
+            "fallback_message": "This message is OMEMO encrypted.",
+            "json_file_path": None,
+        }
 
-    default_config = {
-        "fallback_message": "This message is OMEMO encrypted.",
-        "json_file_path": None,
-    }
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[misc]
+            self.__storage = None  # type: ignore[var-annotated]
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)  # type: ignore[misc]
-        self.__storage = None  # type: ignore[var-annotated]
+        def plugin_init(self) -> None:
+            if not self.json_file_path:  # type: ignore[attr-defined]
+                raise Exception("OMEMO JSON file path not specified.")
+            self.__storage = _StorageImpl(Path(self.json_file_path))  # type: ignore[attr-defined]
+            super().plugin_init()  # type: ignore[misc]
 
-    def plugin_init(self) -> None:
-        if not self.json_file_path:  # type: ignore[attr-defined]
-            raise Exception("OMEMO JSON file path not specified.")
-        self.__storage = _StorageImpl(Path(self.json_file_path))  # type: ignore[attr-defined]
-        super().plugin_init()  # type: ignore[misc]
+        @property
+        def storage(self):
+            return self.__storage
 
-    @property
-    def storage(self):
-        return self.__storage
+        @property
+        def _btbv_enabled(self) -> bool:
+            return True
 
-    @property
-    def _btbv_enabled(self) -> bool:
-        return True
+        async def _devices_blindly_trusted(  # type: ignore[override]
+            self,
+            blindly_trusted,
+            identifier,
+        ) -> None:
+            logger.info("OMEMO: blindly trusted %d device(s) [%s]", len(blindly_trusted), identifier)
 
-    async def _devices_blindly_trusted(  # type: ignore[override]
-        self,
-        blindly_trusted,
-        identifier,
-    ) -> None:
-        logger.info("OMEMO: blindly trusted %d device(s) [%s]", len(blindly_trusted), identifier)
+        async def _prompt_manual_trust(  # type: ignore[override]
+            self,
+            manually_trusted,
+            identifier,
+        ) -> None:
+            # BTBV is enabled so this is rare. Log and auto-distrust to avoid blocking.
+            session_manager = await self.get_session_manager()
+            for device in manually_trusted:
+                logger.warning(
+                    "OMEMO: manual trust required for %s %s — distrusting to avoid block",
+                    device.bare_jid, device.device_id
+                )
+                await session_manager.set_trust(
+                    device.bare_jid,
+                    device.identity_key,
+                    TrustLevel.DISTRUSTED.value
+                )
 
-    async def _prompt_manual_trust(  # type: ignore[override]
-        self,
-        manually_trusted,
-        identifier,
-    ) -> None:
-        # BTBV is enabled so this is rare. Log and auto-distrust to avoid blocking.
-        session_manager = await self.get_session_manager()
-        for device in manually_trusted:
-            logger.warning(
-                "OMEMO: manual trust required for %s %s — distrusting to avoid block",
-                device.bare_jid, device.device_id
-            )
-            await session_manager.set_trust(
-                device.bare_jid,
-                device.identity_key,
-                TrustLevel.DISTRUSTED.value
-            )
-
+else:
+    _StorageImpl = None  # type: ignore[misc,assignment]
+    _XEP_0384Impl = None  # type: ignore[misc,assignment]
 
 # ----------------------------------------------------------------
 # MUC room helpers

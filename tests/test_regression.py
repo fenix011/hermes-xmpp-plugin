@@ -69,8 +69,11 @@ gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
     "on_processing_start": lambda *a, **kw: None,
     "on_processing_complete": lambda *a, **kw: None,
     "send": lambda *a, **kw: None,
+    "send_clarify": lambda *a, **kw: None,
+    "handle_message": lambda *a, **kw: None,
     "build_source": lambda s, **kw: MagicMock(**kw),
     "_mark_disconnected": lambda s: None,
+    "fatal_error_message": lambda s, *a, **kw: "auth failed",
 })
 
 gw_models = unittest.mock.MagicMock()

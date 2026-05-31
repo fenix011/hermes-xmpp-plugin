@@ -4,10 +4,27 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+import unittest.mock
+
+# Mock gateway modules before importing adapter
+for m in ["gateway", "gateway.config", "gateway.platforms", "gateway.platforms.base",
+          "gateway.platforms.models", "gateway.util", "tools", "tools.clarify_gateway"]:
+    sys.modules[m] = unittest.mock.MagicMock()
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import adapter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_adapter_module():
+    """Remove adapter from sys.modules after each test to prevent caching a broken version."""
+    yield
+    for key in list(sys.modules.keys()):
+        if key == "adapter" or key.startswith("adapter."):
+            del sys.modules[key]
 
 
 class Config:

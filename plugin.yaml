@@ -1,11 +1,12 @@
 name: hermes-xmpp-plugin
 label: XMPP/Jabber
 kind: platform
-version: 0.2.0
+version: 0.3.0
 description: >
   Third-party XMPP/Jabber gateway platform plugin for Hermes Agent. Supports
-  1:1 chat, MUC rooms, typing indicators, mandatory STARTTLS, and XEP-0363
-  HTTP file upload.
+  1:1 chat, MUC rooms, typing indicators, message reactions, threaded replies,
+  data forms, ad-hoc commands, message markup, voice messages, mandatory
+  STARTTLS, and XEP-0363 HTTP file upload.
 author: Samuel Proulx / fastfinge, based on work by Eric Lars Lee and Mibay
 requires_env:
   - name: XMPP_JID

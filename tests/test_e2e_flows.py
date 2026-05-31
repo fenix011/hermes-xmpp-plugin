@@ -119,6 +119,13 @@ sys.modules["omemo.types"] = omemo_types
 omemo_types.DeviceInformation = type("DeviceInformation", (), {})
 omemo_types.JSONType = type("JSONType", (), {})
 
+# Force a fresh import so we don't inherit a broken BasePlatformAdapter from another test file's cache
+if "adapter" in sys.modules:
+    del sys.modules["adapter"]
+for key in list(sys.modules.keys()):
+    if key.startswith("adapter."):
+        del sys.modules[key]
+
 import adapter  # noqa: E402
 
 ProcessingOutcome = _FakeProcessingOutcome

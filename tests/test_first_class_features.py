@@ -104,7 +104,7 @@ class _FakeStorage:
     def __init__(self): pass
     async def _load(self, key): pass
     async def _store(self, key, value): pass
-omemo_storage.Just = type("Just", (), {})
+omemo_storage.Just = type("Just", (), {"__init__": lambda self, *a, **k: None})
 omemo_storage.Maybe = type("Maybe", (), {})
 omemo_storage.Nothing = type("Nothing", (), {})
 omemo_storage.Storage = _FakeStorage
@@ -114,6 +114,14 @@ sys.modules["omemo.types"] = omemo_types
 omemo_types.DeviceInformation = type("DeviceInformation", (), {})
 omemo_types.JSONType = type("JSONType", (), {})
 
+import adapter
+
+# Force a fresh import so we don't inherit a broken BasePlatformAdapter from another test file's cache
+if "adapter" in sys.modules:
+    del sys.modules["adapter"]
+for key in list(sys.modules.keys()):
+    if key.startswith("adapter."):
+        del sys.modules[key]
 import adapter
 
 # Wire imported symbols
