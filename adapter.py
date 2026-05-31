@@ -512,11 +512,32 @@ class XmppAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
+        image_paths: Optional[List[str]] = None,
+        voice_path: Optional[str] = None,
+        document_path: Optional[str] = None,
         reply_to: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+        disable_web_page_preview: bool = False,
+        parse_mode: Optional[str] = None,
+        formatting: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
+
+        # Forward legacy media params to dedicated methods
+        if voice_path:
+            return await self.send_voice(chat_id, voice_path, caption=content or None)
+        if document_path:
+            return await self.send_document(chat_id, document_path, caption=content or None)
+        if image_paths:
+            last_result: SendResult | None = None
+            for path in image_paths:
+                last_result = await self.send_image_file(chat_id, path, caption=content if path == image_paths[0] else None)
+                if last_result is not None and not last_result.success:
+                    return last_result
+            return last_result or SendResult(success=True)
 
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
 
