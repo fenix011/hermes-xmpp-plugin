@@ -1,0 +1,47 @@
+name: hermes-xmpp-plugin
+label: XMPP/Jabber
+kind: platform
+version: 0.1.0
+description: >
+  Third-party XMPP/Jabber gateway platform plugin for Hermes Agent. Supports
+  1:1 chat, MUC rooms, typing indicators, mandatory STARTTLS, and XEP-0363
+  HTTP file upload.
+author: Samuel Proulx / fastfinge, based on work by Eric Lars Lee and Mibay
+requires_env:
+  - name: XMPP_JID
+    description: Bot JID, for example hermes@example.org
+    prompt: XMPP bot JID
+    password: false
+  - name: XMPP_PASSWORD
+    description: Bot account password
+    prompt: XMPP bot password
+    password: true
+optional_env:
+  - name: XMPP_HOST
+    description: Optional host override when SRV lookup is not enough
+    prompt: XMPP host override
+    password: false
+  - name: XMPP_PORT
+    description: XMPP client port, defaults to 5222
+    prompt: XMPP port
+    password: false
+  - name: XMPP_ALLOWED_USERS
+    description: Comma-separated bare JIDs allowed to DM the bot
+    prompt: Allowed user JIDs
+    password: false
+  - name: XMPP_ALLOW_ALL_USERS
+    description: Set true only for development; allows any DM and MUC
+    prompt: Allow all users? true/false
+    password: false
+  - name: XMPP_MUC_ROOMS
+    description: Comma-separated room@conference.example.org[/nick] values
+    prompt: MUC rooms
+    password: false
+  - name: XMPP_MUC_NICK
+    description: Default nickname in MUC rooms
+    prompt: MUC nickname
+    password: false
+  - name: XMPP_HOME_CHANNEL
+    description: Default JID or room for cron / send_message delivery
+    prompt: XMPP home channel
+    password: false
