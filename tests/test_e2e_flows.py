@@ -322,9 +322,14 @@ async def test_reply_stanza_populates_reply_fields(adapter_instance):
 async def test_send_uses_xep_0461_when_reply_to_provided(adapter_instance):
     client = adapter_instance.client
     client.plugins["xep_0461"] = MagicMock()
+    stanza = MagicMock()
+    client.plugins["xep_0461"].make_reply.return_value = stanza
     result = await adapter_instance.send(chat_id="user@example.org", content="hi", reply_to="orig-id")
     assert result.success is True
-    client.plugins["xep_0461"].send_reply.assert_called_once()
+    client.plugins["xep_0461"].make_reply.assert_called_once()
+    assert client.plugins["xep_0461"].make_reply.call_args.kwargs["reply_id"] == "orig-id"
+    assert client.plugins["xep_0461"].make_reply.call_args.kwargs["mto"] == "user@example.org"
+    stanza.send.assert_called_once()
 
 
 @pytest.mark.asyncio

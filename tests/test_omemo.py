@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -120,3 +121,46 @@ def test_omemo_values_surface_in_extra():
         },
     )
     assert extra.get("omemo") == {"enabled": True, "storage_path": "/tmp/omemo.json"}
+
+
+# ------------------------------------------------------------------
+# Session-manager recovery
+# ------------------------------------------------------------------
+
+
+def test_omemo_session_manager_resets_failed_init_task():
+    if not adapter.SLIXMPP_OMEMO_AVAILABLE:
+        pytest.skip("slixmpp-omemo not available")
+
+    plugin = adapter._XEP_0384Impl.__new__(adapter._XEP_0384Impl)
+    failed = MagicMock()
+    failed.done.return_value = True
+    setattr(plugin, "_XEP_0384__session_manager_task", failed)
+    setattr(plugin, "_XEP_0384__session_manager", "poisoned")
+
+    plugin._reset_failed_session_manager()
+
+    assert getattr(plugin, "_XEP_0384__session_manager_task") is None
+    assert getattr(plugin, "_XEP_0384__session_manager") is None
+
+
+@pytest.mark.asyncio
+async def test_omemo_session_manager_falls_back_to_oldmemo_for_twomemo_failure(monkeypatch):
+    if not adapter.SLIXMPP_OMEMO_AVAILABLE:
+        pytest.skip("slixmpp-omemo not available")
+
+    plugin = adapter._XEP_0384Impl.__new__(adapter._XEP_0384Impl)
+    plugin.xmpp = MagicMock()
+    plugin.xmpp.event = MagicMock()
+    plugin._create_oldmemo_only_session_manager = AsyncMock(return_value="legacy-manager")
+
+    async def boom(_self):
+        raise RuntimeError("Device list download failed for alice@example.org under namespace urn:xmpp:omemo:2")
+
+    monkeypatch.setattr(adapter.XEP_0384, "get_session_manager", boom, raising=False)
+
+    manager = await plugin.get_session_manager()
+
+    assert manager == "legacy-manager"
+    assert getattr(plugin, "_XEP_0384__session_manager") == "legacy-manager"
+    plugin.xmpp.event.assert_called_once_with("omemo_initialized")

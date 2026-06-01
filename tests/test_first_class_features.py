@@ -313,6 +313,7 @@ async def test_send_with_reply_to_uses_xep0461(fake_adapter, fake_client):
     fake_client.plugins["xep_0461"] = xep0461
     fake_client["xep_0461"] = xep0461
     stanza = MagicMock()
+    xep0461.make_reply.return_value = stanza
     fake_client.make_message.return_value = stanza
 
     result = await fake_adapter.send(
@@ -321,7 +322,11 @@ async def test_send_with_reply_to_uses_xep0461(fake_adapter, fake_client):
         reply_to="orig-msg-id",
     )
     assert result.success is True
-    xep0461.send_reply.assert_called_once()
+    xep0461.make_reply.assert_called_once()
+    assert xep0461.make_reply.call_args.kwargs["reply_id"] == "orig-msg-id"
+    assert xep0461.make_reply.call_args.kwargs["mto"] == "user@example.org"
+    assert xep0461.make_reply.call_args.kwargs["mbody"] == "got it"
+    stanza.send.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -153,13 +153,78 @@ if SLIXMPP_OMEMO_AVAILABLE:
             for device in manually_trusted:
                 logger.warning(
                     "OMEMO: manual trust required for %s %s — distrusting to avoid block",
-                    device.bare_jid, device.device_id
+                    device.bare_jid,
+                    device.device_id
                 )
                 await session_manager.set_trust(
                     device.bare_jid,
                     device.identity_key,
                     TrustLevel.DISTRUSTED.value
                 )
+
+        async def get_session_manager(self):  # type: ignore[override]
+            """Return a usable OMEMO session manager, recovering from failed init.
+
+            slixmpp-omemo caches the in-flight initialization task. If that task
+            fails once (for example, a server times out while fetching a twomemo
+            device list), later decrypt/encrypt attempts await the same failed
+            task forever. That makes one transient PubSub hiccup poison OMEMO
+            until the whole gateway restarts. Reset the cached task on failure.
+
+            Some servers/clients still behave much better with legacy OMEMO
+            (oldmemo) than OMEMO:2 (twomemo). If initialization fails while
+            touching the twomemo namespace, fall back to an oldmemo-only session
+            manager so existing Conversations/Gajim-style devices can still
+            decrypt instead of getting a useless "message from myself" blob.
+            """
+            try:
+                return await super().get_session_manager()  # type: ignore[misc]
+            except Exception as exc:
+                self._reset_failed_session_manager()
+                if "urn:xmpp:omemo:2" in str(exc):
+                    logger.warning(
+                        "OMEMO: twomemo initialization failed (%s); falling back to legacy OMEMO only",
+                        exc,
+                    )
+                    try:
+                        manager = await self._create_oldmemo_only_session_manager()
+                        setattr(self, "_XEP_0384__session_manager", manager)
+                        self.xmpp.event("omemo_initialized")  # type: ignore[attr-defined]
+                        return manager
+                    except Exception:
+                        self._reset_failed_session_manager()
+                        logger.exception("OMEMO: legacy fallback initialization failed")
+                raise
+
+        def _reset_failed_session_manager(self) -> None:
+            task = getattr(self, "_XEP_0384__session_manager_task", None)
+            if task is not None and not getattr(task, "done", lambda: True)():
+                task.cancel()
+            setattr(self, "_XEP_0384__session_manager_task", None)
+            setattr(self, "_XEP_0384__session_manager", None)
+
+        async def _create_oldmemo_only_session_manager(self):
+            from slixmpp_omemo.xep_0384 import _make_session_manager  # type: ignore[import-untyped]
+            from oldmemo.oldmemo import Oldmemo  # type: ignore[import-untyped]
+
+            session_manager_cls = _make_session_manager(self.xmpp, self)  # type: ignore[attr-defined]
+            manager = session_manager_cls.__new__(session_manager_cls)
+            storage = self.storage
+            if storage is None:
+                raise RuntimeError("OMEMO storage is not initialized")
+            backend = Oldmemo(storage)
+            name_map = {
+                "__backends": [backend],
+                "__storage": storage,
+                "__own_bare_jid": self.xmpp.boundjid.bare,  # type: ignore[attr-defined]
+                "__undecided_trust_level_name": TrustLevel.UNDECIDED.value,
+                "__synchronizing": False,
+            }
+            for name, value in name_map.items():
+                setattr(manager, f"_SessionManager{name}", value)
+            own_device_id = (await storage.load_primitive("/own_device_id", int)).from_just()
+            setattr(manager, "_SessionManager__own_device_id", own_device_id)
+            return manager
 
 else:
     _StorageImpl = None  # type: ignore[misc,assignment]
@@ -567,16 +632,18 @@ class XmppAdapter(BasePlatformAdapter):
 
         try:
             client_local = self.client  # type: ignore[assignment]
-            # Use XEP-0461 reply if reply_to is provided and plugin is available
+            # Use XEP-0461 reply if reply_to is provided and plugin is available.
+            # slixmpp 1.15 expects the quoted author JID and quoted message id
+            # as positional parameters, then normal make_message kwargs.
             if reply_to and "xep_0461" in self._registered_plugins:
-                stanza = client_local.make_message(mto=chat_id, mtype=mtype)
-                stanza["body"] = content
-                client_local["xep_0461"].send_reply(
-                    to=JID(chat_id),
-                    to_id=reply_to,
-                    body=content,
-                    msg=stanza,
+                stanza = client_local["xep_0461"].make_reply(
+                    reply_to=JID(chat_id),
+                    reply_id=reply_to,
+                    mto=chat_id,
+                    mbody=content,
+                    mtype=mtype,
                 )
+                stanza.send()
             else:
                 stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
             # Attach XEP-0394 markup if available
