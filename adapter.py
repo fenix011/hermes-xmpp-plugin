@@ -755,6 +755,13 @@ class XmppAdapter(BasePlatformAdapter):
 
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
 
+        # MUC retractions require the room-assigned <stanza-id> (XEP-0359 /
+        # XEP-0424 §5.1), not the client-generated message ID. The adapter
+        # does not currently capture reflected room stanzas, so returning
+        # False for group chats until MUC stanza-id mapping is implemented.
+        if mtype == "groupchat":
+            return False
+
         try:
             self.client["xep_0424"].send_retraction(
                 mto=JID(chat_id),
