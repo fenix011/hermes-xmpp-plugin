@@ -324,7 +324,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
-        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447"):
+        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -663,6 +663,109 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("xmpp: send failed")
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # XEP-0308 Message Correction (edit_message)
+    # -----------------------------------------------------------------
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously sent message using XEP-0308 Last Message Correction."""
+        if self.client is None or not getattr(self, "_running", True):
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+
+        if "xep_0308" not in self._registered_plugins:
+            return SendResult(success=False, error="XEP-0308 not available")
+
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+
+        try:
+            client_local = self.client
+            stanza = client_local["xep_0308"].build_correction(
+                id_to_replace=message_id,
+                mto=JID(chat_id),
+                mtype=mtype,
+                mbody=content,
+            )
+
+            # OMEMO encrypt for 1:1 chats (same path as send())
+            if (
+                "xep_0384" in self._registered_plugins
+                and SLIXMPP_OMEMO_AVAILABLE
+                and mtype == "chat"
+            ):
+                try:
+                    xep_0384 = client_local["xep_0384"]
+                    recipient_jid = JID(chat_id)
+                    encrypted, errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
+                    if errors:
+                        logger.info("OMEMO: edit encryption non-critical errors: %s", errors)
+                    if encrypted is not None:
+                        stanza = encrypted
+                        # encrypt_message clear()s the stanza and rebuilds with only
+                        # OMEMO elements — manually restore the <replace> element that
+                        # was stripped during encryption (see slixmpp-omemo docstring:
+                        # "other elements such as read markers are lost and have to be
+                        # copied over manually").
+                        stanza["replace"]["id"] = message_id
+                        # XEP-0380 EME hint for compatibility
+                        if "xep_0380" in self._registered_plugins:
+                            try:
+                                import oldmemo
+                                ns = oldmemo.oldmemo.NAMESPACE
+                                stanza["eme"]["namespace"] = ns
+                                stanza["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    logger.warning("OMEMO: edit encryption failed for %s (%s), sending plaintext", chat_id, exc)
+
+            stanza.send()
+            msg_id = None
+            try:
+                msg_id = stanza["id"]
+            except Exception:
+                pass
+            return SendResult(success=True, message_id=msg_id)
+        except Exception as exc:
+            logger.exception("xmpp: edit_message failed")
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # XEP-0424 Message Retraction (delete_message)
+    # -----------------------------------------------------------------
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a previously sent message using XEP-0424 Message Retraction."""
+        if self.client is None or not getattr(self, "_running", True):
+            return False
+
+        if "xep_0424" not in self._registered_plugins:
+            return False
+
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+
+        try:
+            self.client["xep_0424"].send_retraction(
+                mto=JID(chat_id),
+                id=message_id,
+                mtype=mtype,
+                include_fallback=False,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("xmpp: delete_message failed: %s", exc)
+            return False
 
     # -----------------------------------------------------------------
     # XEP-0394 Message Markup helper
