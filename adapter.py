@@ -642,10 +642,11 @@ class XmppAdapter(BasePlatformAdapter):
                     mto=chat_id,
                     mbody=content,
                     mtype=mtype,
+                    mchat_state="active",
                 )
                 stanza.send()
             else:
-                stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
+                stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype, mchat_state="active")
             # Attach XEP-0394 markup if available
             if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
                 try:
@@ -843,7 +844,7 @@ class XmppAdapter(BasePlatformAdapter):
         if message is None:
             logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
             client_local = self.client  # type: ignore[assignment]
-            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
+            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype, mchat_state="active")
             msg_id = None
             try:
                 msg_id = stanza["id"]
@@ -864,6 +865,13 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Attach XEP-0085 chat state after encryption (encrypt_message clears
+        # non-OMEMO elements, so we set it on the encrypted message object).
+        if "xep_0085" in self._registered_plugins:
+            try:
+                message["chat_state"] = "active"
+            except Exception:
+                pass
         message.send()
         msg_id = None
         try:
@@ -877,7 +885,10 @@ class XmppAdapter(BasePlatformAdapter):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
-            self.client.send_message(mto=chat_id, mtype=mtype, mchat_state="composing")
+            msg = self.client.make_message(mto=chat_id, mtype=mtype)
+            msg["chat_state"] = "composing"
+            msg["no-store"] = True
+            msg.send()
         except Exception:
             logger.debug("xmpp: send_typing failed", exc_info=True)
 
@@ -886,7 +897,10 @@ class XmppAdapter(BasePlatformAdapter):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
-            self.client.send_message(mto=chat_id, mtype=mtype, mchat_state="active")
+            msg = self.client.make_message(mto=chat_id, mtype=mtype)
+            msg["chat_state"] = "active"
+            msg["no-store"] = True
+            msg.send()
         except Exception:
             logger.debug("xmpp: stop_typing failed", exc_info=True)
 
@@ -976,17 +990,27 @@ class XmppAdapter(BasePlatformAdapter):
     def _extract_reaction_target(self, event: MessageEvent) -> Optional[str]:
         return getattr(event, "message_id", None) or None
 
+    def _send_reaction(self, chat_id: str, target_id: str, reactions: list[str]) -> None:
+        """Send a reaction message with the correct type per XEP-0444 §4.
+
+        XEP-0444 says message type SHOULD be 'chat' or 'groupchat'.
+        Gajim enforces this strictly and rejects type='normal' reactions.
+        """
+        if self.client is None or "xep_0444" not in self._registered_plugins:
+            return
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+        msg = self.client.make_message(mto=chat_id, mtype=mtype)
+        self.client["xep_0444"].set_reactions(msg, target_id, reactions)
+        msg.enable("store")
+        msg.send()
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         if not self._reactions_allowed(event):
             return
         target_id = self._extract_reaction_target(event)
         if target_id and self.client is not None and "xep_0444" in self._registered_plugins:
             try:
-                self.client["xep_0444"].send_reactions(
-                    to=JID(event.source.chat_id),
-                    to_id=target_id,
-                    reactions=["👀"],
-                )
+                self._send_reaction(event.source.chat_id, target_id, ["👀"])
                 self._pending_reactions[target_id] = event
             except Exception:
                 logger.debug("xmpp: failed to send 👀 reaction", exc_info=True)
@@ -1003,26 +1027,14 @@ class XmppAdapter(BasePlatformAdapter):
             return
         try:
             # Remove in-progress reaction
-            self.client["xep_0444"].send_reactions(
-                to=JID(event.source.chat_id),
-                to_id=target_id,
-                reactions=[],
-            )
+            self._send_reaction(event.source.chat_id, target_id, [])
         except Exception:
             logger.debug("xmpp: failed to remove 👀 reaction", exc_info=True)
         try:
             if outcome == ProcessingOutcome.SUCCESS:
-                self.client["xep_0444"].send_reactions(
-                    to=JID(event.source.chat_id),
-                    to_id=target_id,
-                    reactions=["✅"],
-                )
+                self._send_reaction(event.source.chat_id, target_id, ["✅"])
             elif outcome == ProcessingOutcome.FAILURE:
-                self.client["xep_0444"].send_reactions(
-                    to=JID(event.source.chat_id),
-                    to_id=target_id,
-                    reactions=["❌"],
-                )
+                self._send_reaction(event.source.chat_id, target_id, ["❌"])
         except Exception:
             logger.debug("xmpp: failed to send final reaction", exc_info=True)
         finally:
