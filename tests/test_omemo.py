@@ -164,3 +164,59 @@ async def test_omemo_session_manager_falls_back_to_oldmemo_for_twomemo_failure(m
     assert manager == "legacy-manager"
     assert getattr(plugin, "_XEP_0384__session_manager") == "legacy-manager"
     plugin.xmpp.event.assert_called_once_with("omemo_initialized")
+
+
+def test_max_message_length_surfaces_in_extra():
+    extra = adapter._apply_yaml_config(
+        {},
+        {
+            "jid": "bot@example.org",
+            "password": "secret",
+            "max_message_length": 4000,
+        },
+    )
+    assert extra.get("max_message_length") == 4000
+
+
+# ------------------------------------------------------------------
+# OMEMO long-message chunking — _send_encrypted splits before encrypt
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_encrypted_splits_long_message():
+    """_send_encrypted should chunk the body and encrypt each chunk separately."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    a = adapter.XmppAdapter(MagicMock())
+    a.client = MagicMock()  # non-None so the guard passes
+    a.MAX_MESSAGE_LENGTH = 40
+
+    a._send_encrypted_one = AsyncMock(
+        return_value=adapter.SendResult(success=True, message_id="enc")
+    )
+
+    body = ("word " * 60).strip()  # well over 40 chars
+    result = await a._send_encrypted("user@example.org", body)
+
+    assert result.success is True
+    # More than one encrypted stanza was produced.
+    assert a._send_encrypted_one.await_count > 1
+    # Every encrypted chunk respected the limit.
+    for call in a._send_encrypted_one.await_args_list:
+        chunk = call.args[1]
+        assert len(chunk) <= a.MAX_MESSAGE_LENGTH
+
+
+@pytest.mark.asyncio
+async def test_send_encrypted_short_message_single_chunk():
+    from unittest.mock import AsyncMock, MagicMock
+
+    a = adapter.XmppAdapter(MagicMock())
+    a.client = MagicMock()
+    a._send_encrypted_one = AsyncMock(
+        return_value=adapter.SendResult(success=True, message_id="enc")
+    )
+    result = await a._send_encrypted("user@example.org", "short and sweet")
+    assert result.success is True
+    assert a._send_encrypted_one.await_count == 1

@@ -262,9 +262,34 @@ def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
 class XmppAdapter(BasePlatformAdapter):
     """slixmpp-backed adapter satisfying BasePlatformAdapter."""
 
+    # Per-stanza body length cap (Unicode code-points). XMPP itself defines no
+    # protocol-level body limit and slixmpp exposes no negotiated stanza-size
+    # value, so this is a conservative default that every common server
+    # (Prosody, ejabberd, etc.) accepts with room to spare for OMEMO/base64
+    # inflation and XML escaping. Overridable via config/env. The host's
+    # streaming consumer reads this attribute (getattr ... "MAX_MESSAGE_LENGTH")
+    # and the adapter's own send paths chunk against it too.
+    MAX_MESSAGE_LENGTH = 10000
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
         extra = config.extra or {}
+
+        # Allow operators to tune the per-message length cap. A server with a
+        # tighter `max_stanza_size` (or a desire for shorter messages) can lower
+        # it; nobody should need to raise it much. Falls back to the class
+        # default on any bad value. Guarded on isinstance(dict) so MagicMock
+        # configs in tests don't yield a bogus MagicMock-derived int.
+        _max_len_raw = None
+        if isinstance(extra, dict):
+            _max_len_raw = extra.get("max_message_length") or os.getenv("XMPP_MAX_MESSAGE_LENGTH")
+        if _max_len_raw:
+            try:
+                _max_len = int(_max_len_raw)
+                if _max_len > 0:
+                    self.MAX_MESSAGE_LENGTH = _max_len
+            except (TypeError, ValueError):
+                logger.warning("xmpp: invalid max_message_length %r, using default", _max_len_raw)
 
         self.jid: str = str(extra.get("jid") or os.getenv("XMPP_JID", ""))
         self._password: str = str(extra.get("password") or os.getenv("XMPP_PASSWORD", ""))
@@ -632,37 +657,90 @@ class XmppAdapter(BasePlatformAdapter):
 
         try:
             client_local = self.client  # type: ignore[assignment]
-            # Use XEP-0461 reply if reply_to is provided and plugin is available.
-            # slixmpp 1.15 expects the quoted author JID and quoted message id
-            # as positional parameters, then normal make_message kwargs.
-            if reply_to and "xep_0461" in self._registered_plugins:
-                stanza = client_local["xep_0461"].make_reply(
-                    reply_to=JID(chat_id),
-                    reply_id=reply_to,
-                    mto=chat_id,
-                    mbody=content,
-                    mtype=mtype,
-                )
-                stanza.send()
-            else:
-                stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
-            # Attach XEP-0394 markup if available
-            if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
+            # Split overly long bodies into multiple stanzas. truncate_message
+            # (inherited from BasePlatformAdapter) preserves code-fence
+            # boundaries and adds "(1/N)" indicators.
+            chunks = self._chunk_body(content)
+            last_stanza = None
+            last_msg_id = None
+            for idx, chunk in enumerate(chunks):
+                # Only the first chunk threads as a reply (XEP-0461); the rest
+                # are plain follow-up messages.
+                if idx == 0 and reply_to and "xep_0461" in self._registered_plugins:
+                    stanza = client_local.make_message(mto=chat_id, mtype=mtype)
+                    stanza["body"] = chunk
+                    client_local["xep_0461"].send_reply(
+                        to=JID(chat_id),
+                        to_id=reply_to,
+                        body=chunk,
+                        msg=stanza,
+                    )
+                else:
+                    stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype)
+                # Attach XEP-0394 markup if available
+                if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
+                    try:
+                        markup = self._build_markup(chunk)
+                        if markup is not None:
+                            stanza.xml.append(markup.xml)
+                    except Exception:
+                        logger.debug("xmpp: failed to attach markup", exc_info=True)
+                last_stanza = stanza
                 try:
-                    markup = self._build_markup(content)
-                    if markup is not None:
-                        stanza.xml.append(markup.xml)
+                    last_msg_id = stanza["id"]
                 except Exception:
-                    logger.debug("xmpp: failed to attach markup", exc_info=True)
-            msg_id = None
-            try:
-                msg_id = stanza["id"]
-            except Exception:
-                pass
-            return SendResult(success=True, message_id=msg_id, raw_response=stanza)
+                    pass
+            return SendResult(success=True, message_id=last_msg_id, raw_response=last_stanza)
         except Exception as exc:
             logger.exception("xmpp: send failed")
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # Message chunking
+    # -----------------------------------------------------------------
+
+    def _chunk_body(self, content: str) -> List[str]:
+        """Split a message body into stanza-sized chunks.
+
+        Prefers the inherited ``truncate_message`` (preserves code-fence
+        boundaries, adds "(1/N)" indicators) against ``MAX_MESSAGE_LENGTH``.
+        Falls back to a simple boundary-aware splitter if that helper is
+        unavailable (e.g. an older host or a stubbed base in tests). Always
+        returns at least one chunk so callers can loop unconditionally; an
+        empty body yields a single empty chunk.
+        """
+        if not content:
+            return [content]
+        limit = self.MAX_MESSAGE_LENGTH
+        if len(content) <= limit:
+            return [content]
+        truncate = getattr(self, "truncate_message", None)
+        if callable(truncate):
+            try:
+                chunks = list(truncate(content, limit))  # type: ignore[arg-type]
+                if chunks:
+                    return chunks
+            except Exception:
+                logger.debug("xmpp: truncate_message failed, using fallback splitter", exc_info=True)
+        return self._fallback_split(content, limit)
+
+    @staticmethod
+    def _fallback_split(content: str, limit: int) -> List[str]:
+        """Simple length-bounded splitter, preferring newline/space boundaries."""
+        chunks: List[str] = []
+        remaining = content
+        while len(remaining) > limit:
+            window = remaining[:limit]
+            split_at = window.rfind("\n")
+            if split_at < limit // 2:
+                split_at = window.rfind(" ")
+            if split_at < 1:
+                split_at = limit
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip("\n ")
+        if remaining:
+            chunks.append(remaining)
+        return chunks or [content]
 
     # -----------------------------------------------------------------
     # XEP-0394 Message Markup helper
@@ -714,7 +792,23 @@ class XmppAdapter(BasePlatformAdapter):
         return markup if spans else None
 
     async def _send_encrypted(self, chat_id: str, content: str) -> SendResult:
-        """Send an OMEMO-encrypted 1:1 chat message."""
+        """Send an OMEMO-encrypted 1:1 chat message, splitting long bodies.
+
+        Each chunk is encrypted and sent as its own stanza. The result of the
+        last chunk is returned; the first failing chunk short-circuits.
+        """
+        if self.client is None:
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+        chunks = self._chunk_body(content)
+        last_result = SendResult(success=True)
+        for chunk in chunks:
+            last_result = await self._send_encrypted_one(chat_id, chunk)
+            if not last_result.success:
+                return last_result
+        return last_result
+
+    async def _send_encrypted_one(self, chat_id: str, content: str) -> SendResult:
+        """Encrypt and send a single OMEMO stanza (one chunk)."""
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
         client_local = self.client  # type: ignore[assignment]
@@ -1200,7 +1294,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     extra = dict(raw.get("extra") or {})
     for key in (
         "jid", "password", "host", "port", "muc_rooms", "muc_nick",
-        "allowed_users", "allow_all_users",
+        "allowed_users", "allow_all_users", "max_message_length",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]

@@ -323,13 +323,15 @@ async def test_send_uses_xep_0461_when_reply_to_provided(adapter_instance):
     client = adapter_instance.client
     client.plugins["xep_0461"] = MagicMock()
     stanza = MagicMock()
-    client.plugins["xep_0461"].make_reply.return_value = stanza
+    client.make_message.return_value = stanza
     result = await adapter_instance.send(chat_id="user@example.org", content="hi", reply_to="orig-id")
     assert result.success is True
-    client.plugins["xep_0461"].make_reply.assert_called_once()
-    assert client.plugins["xep_0461"].make_reply.call_args.kwargs["reply_id"] == "orig-id"
-    assert client.plugins["xep_0461"].make_reply.call_args.kwargs["mto"] == "user@example.org"
-    stanza.send.assert_called_once()
+    # First (and only) chunk threads as a reply via send_reply
+    client.plugins["xep_0461"].send_reply.assert_called_once()
+    call = client.plugins["xep_0461"].send_reply.call_args
+    assert call.kwargs["to_id"] == "orig-id"
+    assert call.kwargs["to"] == "user@example.org"
+    assert call.kwargs["body"] == "hi"
 
 
 @pytest.mark.asyncio
@@ -505,3 +507,85 @@ async def test_adhoc_setup_without_client_is_safe():
     a.client = None
     a._registered_plugins = {"xep_0050"}
     await a._setup_adhoc_commands()
+
+
+# -----------------------------------------------------------------
+# Long-message chunking
+# -----------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_short_message_sends_single_stanza(adapter_instance):
+    client = adapter_instance.client
+    result = await adapter_instance.send(chat_id="user@example.org", content="short")
+    assert result.success is True
+    assert client.send_message.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_long_message_splits_into_multiple_stanzas(adapter_instance):
+    client = adapter_instance.client
+    adapter_instance.MAX_MESSAGE_LENGTH = 100
+    # ~5x the limit, with spaces so the splitter has natural boundaries.
+    body = ("word " * 120).strip()
+    result = await adapter_instance.send(chat_id="user@example.org", content=body)
+    assert result.success is True
+    assert client.send_message.call_count > 1
+    # Every chunk body must respect the configured limit.
+    for call in client.send_message.call_args_list:
+        assert len(call.kwargs["mbody"]) <= adapter_instance.MAX_MESSAGE_LENGTH
+
+
+@pytest.mark.asyncio
+async def test_long_message_preserves_full_content(adapter_instance):
+    client = adapter_instance.client
+    adapter_instance.MAX_MESSAGE_LENGTH = 50
+    body = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+    await adapter_instance.send(chat_id="user@example.org", content=body)
+    sent = [c.kwargs["mbody"] for c in client.send_message.call_args_list]
+    # No word should be lost when we strip indicators and rejoin.
+    rejoined = " ".join(sent)
+    for token in body.split():
+        assert token in rejoined
+
+
+@pytest.mark.asyncio
+async def test_long_reply_threads_only_first_chunk(adapter_instance):
+    client = adapter_instance.client
+    xep0461 = MagicMock()
+    client.plugins["xep_0461"] = xep0461
+    adapter_instance.MAX_MESSAGE_LENGTH = 60
+    body = ("token " * 60).strip()
+    result = await adapter_instance.send(
+        chat_id="user@example.org", content=body, reply_to="orig-id"
+    )
+    assert result.success is True
+    # Reply stanza only for the first chunk; remaining chunks are plain sends.
+    xep0461.send_reply.assert_called_once()
+    assert client.send_message.call_count >= 1
+
+
+def test_fallback_split_respects_limit_and_keeps_content():
+    body = "a" * 25 + " " + "b" * 25 + " " + "c" * 25
+    chunks = adapter.XmppAdapter._fallback_split(body, 30)
+    assert len(chunks) > 1
+    assert all(len(c) <= 30 for c in chunks)
+    assert "".join(chunks).replace(" ", "") == body.replace(" ", "")
+
+
+def test_chunk_body_empty_returns_single_empty():
+    a = adapter.XmppAdapter(MagicMock())
+    assert a._chunk_body("") == [""]
+
+
+def test_max_message_length_configurable_via_extra():
+    cfg = MagicMock()
+    cfg.extra = {"jid": "bot@example.org", "password": "x", "max_message_length": 2048}
+    a = adapter.XmppAdapter(cfg)
+    assert a.MAX_MESSAGE_LENGTH == 2048
+
+
+def test_max_message_length_defaults_when_invalid():
+    cfg = MagicMock()
+    cfg.extra = {"jid": "bot@example.org", "password": "x", "max_message_length": "not-a-number"}
+    a = adapter.XmppAdapter(cfg)
+    assert a.MAX_MESSAGE_LENGTH == 10000

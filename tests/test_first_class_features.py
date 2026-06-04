@@ -322,11 +322,12 @@ async def test_send_with_reply_to_uses_xep0461(fake_adapter, fake_client):
         reply_to="orig-msg-id",
     )
     assert result.success is True
-    xep0461.make_reply.assert_called_once()
-    assert xep0461.make_reply.call_args.kwargs["reply_id"] == "orig-msg-id"
-    assert xep0461.make_reply.call_args.kwargs["mto"] == "user@example.org"
-    assert xep0461.make_reply.call_args.kwargs["mbody"] == "got it"
-    stanza.send.assert_called_once()
+    # First (and only) chunk threads as a reply via send_reply
+    xep0461.send_reply.assert_called_once()
+    call = xep0461.send_reply.call_args
+    assert call.kwargs["to_id"] == "orig-msg-id"
+    assert call.kwargs["to"] == "user@example.org"
+    assert call.kwargs["body"] == "got it"
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Automatic long-message splitting**: Outbound messages longer than
+  `MAX_MESSAGE_LENGTH` (default 10000 chars) are split into multiple stanzas on
+  word/code-fence boundaries instead of being truncated. Applies to plaintext,
+  OMEMO-encrypted, and standalone (cron / `send_message`) send paths. The limit
+  is configurable via the `max_message_length` config key or the
+  `XMPP_MAX_MESSAGE_LENGTH` env var. The adapter now exposes `MAX_MESSAGE_LENGTH`
+  so the host's streaming consumer chunks against the same value.
+
 ## [0.3.0] — First-class XMPP
 
 ### Added
