@@ -321,25 +321,34 @@ async def test_reply_stanza_populates_reply_fields(adapter_instance):
 @pytest.mark.asyncio
 async def test_send_uses_xep_0461_when_reply_to_provided(adapter_instance):
     client = adapter_instance.client
-    client.plugins["xep_0461"] = MagicMock()
-    stanza = MagicMock()
-    client.make_message.return_value = stanza
+    xep0461 = MagicMock()
+    reply_stanza = MagicMock()
+    xep0461.make_reply.return_value = reply_stanza
+    client.plugins["xep_0461"] = xep0461
     result = await adapter_instance.send(chat_id="user@example.org", content="hi", reply_to="orig-id")
     assert result.success is True
-    # First (and only) chunk threads as a reply via send_reply
-    client.plugins["xep_0461"].send_reply.assert_called_once()
-    call = client.plugins["xep_0461"].send_reply.call_args
-    assert call.kwargs["to_id"] == "orig-id"
-    assert call.kwargs["to"] == "user@example.org"
-    assert call.kwargs["body"] == "hi"
+    # First (and only) chunk threads as a reply via make_reply(reply_to,
+    # reply_id, **msg_kwargs) — the slixmpp 1.15 signature — then .send().
+    xep0461.make_reply.assert_called_once()
+    call = xep0461.make_reply.call_args
+    # reply_to (quoted author JID) and reply_id are positional
+    assert str(call.args[0]) == "user@example.org"
+    assert call.args[1] == "orig-id"
+    assert call.kwargs["mbody"] == "hi"
+    assert call.kwargs["mto"] == "user@example.org"
+    reply_stanza.send.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_send_uses_plain_send_message_without_reply_to(adapter_instance):
+async def test_send_uses_plain_message_without_reply_to(adapter_instance):
     client = adapter_instance.client
+    stanza = MagicMock()
+    client.make_message.return_value = stanza
     result = await adapter_instance.send(chat_id="user@example.org", content="hi")
     assert result.success is True
-    client.send_message.assert_called_once()
+    # No reply context → plain make_message(...) + .send()
+    client.make_message.assert_called_once()
+    stanza.send.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -518,7 +527,7 @@ async def test_short_message_sends_single_stanza(adapter_instance):
     client = adapter_instance.client
     result = await adapter_instance.send(chat_id="user@example.org", content="short")
     assert result.success is True
-    assert client.send_message.call_count == 1
+    assert client.make_message.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -529,9 +538,9 @@ async def test_long_message_splits_into_multiple_stanzas(adapter_instance):
     body = ("word " * 120).strip()
     result = await adapter_instance.send(chat_id="user@example.org", content=body)
     assert result.success is True
-    assert client.send_message.call_count > 1
+    assert client.make_message.call_count > 1
     # Every chunk body must respect the configured limit.
-    for call in client.send_message.call_args_list:
+    for call in client.make_message.call_args_list:
         assert len(call.kwargs["mbody"]) <= adapter_instance.MAX_MESSAGE_LENGTH
 
 
@@ -541,7 +550,7 @@ async def test_long_message_preserves_full_content(adapter_instance):
     adapter_instance.MAX_MESSAGE_LENGTH = 50
     body = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
     await adapter_instance.send(chat_id="user@example.org", content=body)
-    sent = [c.kwargs["mbody"] for c in client.send_message.call_args_list]
+    sent = [c.kwargs["mbody"] for c in client.make_message.call_args_list]
     # No word should be lost when we strip indicators and rejoin.
     rejoined = " ".join(sent)
     for token in body.split():
@@ -559,9 +568,10 @@ async def test_long_reply_threads_only_first_chunk(adapter_instance):
         chat_id="user@example.org", content=body, reply_to="orig-id"
     )
     assert result.success is True
-    # Reply stanza only for the first chunk; remaining chunks are plain sends.
-    xep0461.send_reply.assert_called_once()
-    assert client.send_message.call_count >= 1
+    # Reply stanza only for the first chunk; remaining chunks are plain
+    # make_message sends.
+    xep0461.make_reply.assert_called_once()
+    assert client.make_message.call_count >= 1
 
 
 def test_fallback_split_respects_limit_and_keeps_content():

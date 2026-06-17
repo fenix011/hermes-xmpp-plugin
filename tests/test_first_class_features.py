@@ -285,7 +285,8 @@ async def test_send_clarify_falls_back_to_text(fake_adapter, fake_client):
         clarify_id="clarify-1",
         session_key="sess-1",
     )
-    fake_client.send_message.assert_called_once()
+    # Text fallback routes through send() → make_message(...).send()
+    fake_client.make_message.assert_called_once()
     assert result.success is True
 
 
@@ -322,19 +323,25 @@ async def test_send_with_reply_to_uses_xep0461(fake_adapter, fake_client):
         reply_to="orig-msg-id",
     )
     assert result.success is True
-    # First (and only) chunk threads as a reply via send_reply
-    xep0461.send_reply.assert_called_once()
-    call = xep0461.send_reply.call_args
-    assert call.kwargs["to_id"] == "orig-msg-id"
-    assert call.kwargs["to"] == "user@example.org"
-    assert call.kwargs["body"] == "got it"
+    # First (and only) chunk threads as a reply via make_reply(reply_to,
+    # reply_id, **msg_kwargs) then .send() (slixmpp 1.15 signature).
+    xep0461.make_reply.assert_called_once()
+    call = xep0461.make_reply.call_args
+    assert str(call.args[0]) == "user@example.org"
+    assert call.args[1] == "orig-msg-id"
+    assert call.kwargs["mbody"] == "got it"
+    assert call.kwargs["mto"] == "user@example.org"
+    stanza.send.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_send_without_reply_to_uses_send_message(fake_adapter, fake_client):
+async def test_send_without_reply_to_uses_plain_message(fake_adapter, fake_client):
+    stanza = MagicMock()
+    fake_client.make_message.return_value = stanza
     result = await fake_adapter.send(chat_id="user@example.org", content="hello")
     assert result.success is True
-    fake_client.send_message.assert_called_once()
+    fake_client.make_message.assert_called_once()
+    stanza.send.assert_called_once()
 
 
 # ------------------------------------------------------------------

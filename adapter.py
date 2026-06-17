@@ -327,6 +327,11 @@ class XmppAdapter(BasePlatformAdapter):
         self._session_ready: Optional[asyncio.Event] = None
         self._self_bare = self._bare(self.jid)
         self._known_mucs = {r.room for r in self.muc_rooms}
+        # Bare JIDs we have observed sending us 1:1 ("chat") messages. Used to
+        # keep _is_muc() from misclassifying a real user as a group when the
+        # user's domain happens to match a MUC-style prefix (e.g. Snikket
+        # installs to "chat.example.com", so users are alice@chat.example.com).
+        self._known_dms: set[str] = set()
         self._registered_plugins: set[str] = set()
 
         # Reaction state: message_id → original stanza (for lifecycle hooks)
@@ -538,6 +543,9 @@ class XmppAdapter(BasePlatformAdapter):
                 chat_id = from_bare
                 user_name = None
                 user_id = from_bare
+                # Remember this is a real 1:1 peer so we never reply to it as a
+                # group, regardless of the domain's prefix (see _known_dms).
+                self._known_dms.add(from_bare)
 
             if not self._is_authorized(chat_type=chat_type, chat_id=chat_id, user_jid=user_id):
                 logger.debug(
@@ -669,29 +677,33 @@ class XmppAdapter(BasePlatformAdapter):
             include_chat_state = "xep_0085" in self._registered_plugins
             for idx, chunk in enumerate(chunks):
                 # Only the first chunk threads as a reply (XEP-0461); the rest
-                # are plain follow-up messages.
-                if idx == 0 and reply_to and "xep_0461" in self._registered_plugins:
-                    stanza = client_local.make_message(mto=chat_id, mtype=mtype)
-                    stanza["body"] = chunk
-                    if include_chat_state:
-                        try:
-                            stanza["chat_state"] = "active"
-                        except Exception:
-                            pass
-                    client_local["xep_0461"].send_reply(
-                        to=JID(chat_id),
-                        to_id=reply_to,
-                        body=chunk,
-                        msg=stanza,
+                # are plain follow-up messages. Build each stanza here WITHOUT
+                # sending so markup (XEP-0394) can be attached before it goes
+                # out; the single .send() happens at the end of the loop body.
+                reply_chunk = (
+                    idx == 0 and reply_to and "xep_0461" in self._registered_plugins
+                )
+                if reply_chunk:
+                    # slixmpp 1.15 XEP-0461: make_reply(reply_to, reply_id,
+                    # **msg_kwargs) where msg_kwargs feed make_message (mto/
+                    # mbody required). It returns the stanza WITHOUT sending.
+                    stanza = client_local["xep_0461"].make_reply(
+                        JID(chat_id),
+                        reply_to,
+                        mto=chat_id,
+                        mbody=chunk,
+                        mtype=mtype,
                     )
                 else:
-                    if include_chat_state:
-                        stanza = client_local.send_message(
-                            mto=chat_id, mbody=chunk, mtype=mtype, mchat_state="active"
-                        )
-                    else:
-                        stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype)
-                # Attach XEP-0394 markup if available
+                    stanza = client_local.make_message(
+                        mto=chat_id, mbody=chunk, mtype=mtype
+                    )
+                if include_chat_state:
+                    try:
+                        stanza["chat_state"] = "active"
+                    except Exception:
+                        pass
+                # Attach XEP-0394 markup if available (before sending).
                 if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
                     try:
                         markup = self._build_markup(chunk)
@@ -699,6 +711,7 @@ class XmppAdapter(BasePlatformAdapter):
                             stanza.xml.append(markup.xml)
                     except Exception:
                         logger.debug("xmpp: failed to attach markup", exc_info=True)
+                stanza.send()
                 last_stanza = stanza
                 try:
                     last_msg_id = stanza["id"]
@@ -1326,11 +1339,18 @@ class XmppAdapter(BasePlatformAdapter):
         chat_type = "group" if self._is_muc(chat_id) else "dm"
         return {"chat_id": chat_id, "type": chat_type, "name": chat_id}
 
-    _MUC_DOMAIN_PREFIXES = ("conference.", "muc.", "rooms.", "chat.", "groups.")
+    # MUC-only subdomains by strong convention. "chat." is deliberately NOT
+    # here: Snikket (and others) recommend installing to chat.example.com as
+    # the primary *user* domain, so alice@chat.example.com is a 1:1 contact,
+    # not a room. Membership is driven by _known_mucs / _known_dms instead.
+    _MUC_DOMAIN_PREFIXES = ("conference.", "muc.", "rooms.", "groups.")
 
     def _is_muc(self, chat_id: str) -> bool:
+        # Explicit knowledge wins over any heuristic.
         if chat_id in self._known_mucs:
             return True
+        if chat_id in self._known_dms:
+            return False
         domain = chat_id.split("@", 1)[-1]
         return any(domain.startswith(p) for p in self._MUC_DOMAIN_PREFIXES)
 
