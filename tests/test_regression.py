@@ -257,3 +257,47 @@ class TestOmemoStorage:
         asyncio.run(store._store("gone", 1))
         asyncio.run(store._delete("gone"))
         assert "gone" not in store._data
+
+
+# -----------------------------------------------------------------
+# 6. MUC vs DM classification (issue #2 — Snikket "chat." domains)
+# -----------------------------------------------------------------
+
+class TestMucClassification:
+    def _adapter(self):
+        cfg = MagicMock()
+        cfg.jid = "hermes@chat.example.org"
+        cfg.password = "secret"
+        cfg.home_channel = None
+        cfg.fileserver_url = None
+        a = adapter.XmppAdapter(cfg)
+        a._self_bare = "hermes@chat.example.org"
+        return a
+
+    def test_snikket_user_domain_is_dm_not_muc(self):
+        """Snikket installs to chat.example.org as the *user* domain, so
+        alice@chat.example.org is a 1:1 contact, not a room (issue #2)."""
+        a = self._adapter()
+        assert a._is_muc("alice@chat.example.org") is False
+
+    def test_conventional_muc_subdomains_still_detected(self):
+        a = self._adapter()
+        for jid in (
+            "room@conference.example.org",
+            "room@muc.example.org",
+            "room@rooms.example.org",
+            "room@groups.example.org",
+        ):
+            assert a._is_muc(jid) is True, jid
+
+    def test_known_muc_membership_wins(self):
+        a = self._adapter()
+        a._known_mucs.add("team@chat.example.org")
+        # Explicitly-joined room on a chat.* domain is still a MUC.
+        assert a._is_muc("team@chat.example.org") is True
+
+    def test_observed_dm_never_classified_as_muc(self):
+        a = self._adapter()
+        # Simulate having received a 1:1 message from this peer.
+        a._known_dms.add("bob@conference.example.org")
+        assert a._is_muc("bob@conference.example.org") is False
