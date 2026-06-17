@@ -223,8 +223,8 @@ async def test_on_processing_complete_success(fake_adapter, fake_client):
 
     await fake_adapter.on_processing_complete(event=evt, outcome=ProcessingOutcome.SUCCESS)
 
-    xep0444.send_reactions.assert_called()
-    calls = xep0444.send_reactions.call_args_list
+    xep0444.set_reactions.assert_called()
+    calls = xep0444.set_reactions.call_args_list
     assert any("✅" in str(c) for c in calls)
 
 
@@ -244,8 +244,8 @@ async def test_on_processing_complete_error(fake_adapter, fake_client):
 
     await fake_adapter.on_processing_complete(event=evt, outcome=ProcessingOutcome.FAILURE)
 
-    xep0444.send_reactions.assert_called()
-    calls = xep0444.send_reactions.call_args_list
+    xep0444.set_reactions.assert_called()
+    calls = xep0444.set_reactions.call_args_list
     assert any("❌" in str(c) for c in calls)
 
 

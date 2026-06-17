@@ -349,7 +349,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
-        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447"):
+        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -663,12 +663,21 @@ class XmppAdapter(BasePlatformAdapter):
             chunks = self._chunk_body(content)
             last_stanza = None
             last_msg_id = None
+            # XEP-0085 §5.1: a message carrying a <body> SHOULD include a chat
+            # state notification. Embed <active/> on body messages when the
+            # plugin is available (consistent with _send_encrypted()).
+            include_chat_state = "xep_0085" in self._registered_plugins
             for idx, chunk in enumerate(chunks):
                 # Only the first chunk threads as a reply (XEP-0461); the rest
                 # are plain follow-up messages.
                 if idx == 0 and reply_to and "xep_0461" in self._registered_plugins:
                     stanza = client_local.make_message(mto=chat_id, mtype=mtype)
                     stanza["body"] = chunk
+                    if include_chat_state:
+                        try:
+                            stanza["chat_state"] = "active"
+                        except Exception:
+                            pass
                     client_local["xep_0461"].send_reply(
                         to=JID(chat_id),
                         to_id=reply_to,
@@ -676,7 +685,12 @@ class XmppAdapter(BasePlatformAdapter):
                         msg=stanza,
                     )
                 else:
-                    stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype)
+                    if include_chat_state:
+                        stanza = client_local.send_message(
+                            mto=chat_id, mbody=chunk, mtype=mtype, mchat_state="active"
+                        )
+                    else:
+                        stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype)
                 # Attach XEP-0394 markup if available
                 if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
                     try:
@@ -741,6 +755,116 @@ class XmppAdapter(BasePlatformAdapter):
         if remaining:
             chunks.append(remaining)
         return chunks or [content]
+
+    # -----------------------------------------------------------------
+    # XEP-0308 Message Correction (edit_message)
+    # -----------------------------------------------------------------
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously sent message using XEP-0308 Last Message Correction."""
+        if self.client is None or not getattr(self, "_running", True):
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+
+        if "xep_0308" not in self._registered_plugins:
+            return SendResult(success=False, error="XEP-0308 not available")
+
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+
+        try:
+            client_local = self.client
+            stanza = client_local["xep_0308"].build_correction(
+                id_to_replace=message_id,
+                mto=JID(chat_id),
+                mtype=mtype,
+                mbody=content,
+            )
+
+            # OMEMO encrypt for 1:1 chats (same path as send())
+            if (
+                "xep_0384" in self._registered_plugins
+                and SLIXMPP_OMEMO_AVAILABLE
+                and mtype == "chat"
+            ):
+                try:
+                    xep_0384 = client_local["xep_0384"]
+                    recipient_jid = JID(chat_id)
+                    encrypted, errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
+                    if errors:
+                        logger.info("OMEMO: edit encryption non-critical errors: %s", errors)
+                    if encrypted is not None:
+                        stanza = encrypted
+                        # encrypt_message clear()s the stanza and rebuilds with only
+                        # OMEMO elements — manually restore the <replace> element that
+                        # was stripped during encryption (see slixmpp-omemo docstring:
+                        # "other elements such as read markers are lost and have to be
+                        # copied over manually").
+                        stanza["replace"]["id"] = message_id
+                        # XEP-0380 EME hint for compatibility
+                        if "xep_0380" in self._registered_plugins:
+                            try:
+                                import oldmemo
+                                ns = oldmemo.oldmemo.NAMESPACE
+                                stanza["eme"]["namespace"] = ns
+                                stanza["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    logger.warning("OMEMO: edit encryption failed for %s (%s), sending plaintext", chat_id, exc)
+
+            stanza.send()
+            msg_id = None
+            try:
+                msg_id = stanza["id"]
+            except Exception:
+                pass
+            return SendResult(success=True, message_id=msg_id)
+        except Exception as exc:
+            logger.exception("xmpp: edit_message failed")
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    # -----------------------------------------------------------------
+    # XEP-0424 Message Retraction (delete_message)
+    # -----------------------------------------------------------------
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a previously sent message using XEP-0424 Message Retraction."""
+        if self.client is None or not getattr(self, "_running", True):
+            return False
+
+        if "xep_0424" not in self._registered_plugins:
+            return False
+
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+
+        # MUC retractions require the room-assigned <stanza-id> (XEP-0359 /
+        # XEP-0424 §5.1), not the client-generated message ID. The adapter
+        # does not currently capture reflected room stanzas, so returning
+        # False for group chats until MUC stanza-id mapping is implemented.
+        if mtype == "groupchat":
+            return False
+
+        try:
+            self.client["xep_0424"].send_retraction(
+                mto=JID(chat_id),
+                id=message_id,
+                mtype=mtype,
+                include_fallback=False,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("xmpp: delete_message failed: %s", exc)
+            return False
 
     # -----------------------------------------------------------------
     # XEP-0394 Message Markup helper
@@ -827,7 +951,7 @@ class XmppAdapter(BasePlatformAdapter):
         if message is None:
             logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
             client_local = self.client  # type: ignore[assignment]
-            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype)
+            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype, mchat_state="active")
             msg_id = None
             try:
                 msg_id = stanza["id"]
@@ -848,6 +972,13 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Attach XEP-0085 chat state after encryption (encrypt_message clears
+        # non-OMEMO elements, so we set it on the encrypted message object).
+        if "xep_0085" in self._registered_plugins:
+            try:
+                message["chat_state"] = "active"
+            except Exception:
+                pass
         message.send()
         msg_id = None
         try:
@@ -861,7 +992,10 @@ class XmppAdapter(BasePlatformAdapter):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
-            self.client.send_message(mto=chat_id, mtype=mtype, mchat_state="composing")
+            msg = self.client.make_message(mto=chat_id, mtype=mtype)
+            msg["chat_state"] = "composing"
+            msg["no-store"] = True
+            msg.send()
         except Exception:
             logger.debug("xmpp: send_typing failed", exc_info=True)
 
@@ -870,7 +1004,10 @@ class XmppAdapter(BasePlatformAdapter):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
-            self.client.send_message(mto=chat_id, mtype=mtype, mchat_state="active")
+            msg = self.client.make_message(mto=chat_id, mtype=mtype)
+            msg["chat_state"] = "active"
+            msg["no-store"] = True
+            msg.send()
         except Exception:
             logger.debug("xmpp: stop_typing failed", exc_info=True)
 
@@ -960,17 +1097,27 @@ class XmppAdapter(BasePlatformAdapter):
     def _extract_reaction_target(self, event: MessageEvent) -> Optional[str]:
         return getattr(event, "message_id", None) or None
 
+    def _send_reaction(self, chat_id: str, target_id: str, reactions: list[str]) -> None:
+        """Send a reaction message with the correct type per XEP-0444 §4.
+
+        XEP-0444 says message type SHOULD be 'chat' or 'groupchat'.
+        Gajim enforces this strictly and rejects type='normal' reactions.
+        """
+        if self.client is None or "xep_0444" not in self._registered_plugins:
+            return
+        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+        msg = self.client.make_message(mto=chat_id, mtype=mtype)
+        self.client["xep_0444"].set_reactions(msg, target_id, reactions)
+        msg.enable("store")
+        msg.send()
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         if not self._reactions_allowed(event):
             return
         target_id = self._extract_reaction_target(event)
         if target_id and self.client is not None and "xep_0444" in self._registered_plugins:
             try:
-                self.client["xep_0444"].send_reactions(
-                    to=JID(event.source.chat_id),
-                    to_id=target_id,
-                    reactions=["👀"],
-                )
+                self._send_reaction(event.source.chat_id, target_id, ["👀"])
                 self._pending_reactions[target_id] = event
             except Exception:
                 logger.debug("xmpp: failed to send 👀 reaction", exc_info=True)
@@ -987,26 +1134,14 @@ class XmppAdapter(BasePlatformAdapter):
             return
         try:
             # Remove in-progress reaction
-            self.client["xep_0444"].send_reactions(
-                to=JID(event.source.chat_id),
-                to_id=target_id,
-                reactions=[],
-            )
+            self._send_reaction(event.source.chat_id, target_id, [])
         except Exception:
             logger.debug("xmpp: failed to remove 👀 reaction", exc_info=True)
         try:
             if outcome == ProcessingOutcome.SUCCESS:
-                self.client["xep_0444"].send_reactions(
-                    to=JID(event.source.chat_id),
-                    to_id=target_id,
-                    reactions=["✅"],
-                )
+                self._send_reaction(event.source.chat_id, target_id, ["✅"])
             elif outcome == ProcessingOutcome.FAILURE:
-                self.client["xep_0444"].send_reactions(
-                    to=JID(event.source.chat_id),
-                    to_id=target_id,
-                    reactions=["❌"],
-                )
+                self._send_reaction(event.source.chat_id, target_id, ["❌"])
         except Exception:
             logger.debug("xmpp: failed to send final reaction", exc_info=True)
         finally:

@@ -368,17 +368,17 @@ async def test_reaction_lifecycle_from_start_to_success(adapter_instance):
     evt.message_id = "msg-r1"
 
     await adapter_instance.on_processing_start(evt)
-    client.plugins["xep_0444"].send_reactions.assert_called_with(
-        to=adapter.JID("user@example.org"),
-        to_id="msg-r1",
-        reactions=["👀"],
-    )
+    # XEP-0444 §4: reactions go out via set_reactions() on a typed message
+    # (chat/groupchat), not slixmpp's send_reactions() which omits the type.
+    start_call = client.plugins["xep_0444"].set_reactions.call_args
+    assert start_call.args[1] == "msg-r1"
+    assert start_call.args[2] == ["👀"]
     assert "msg-r1" in adapter_instance._pending_reactions
 
     await adapter_instance.on_processing_complete(evt, ProcessingOutcome.SUCCESS)
-    calls = client.plugins["xep_0444"].send_reactions.call_args_list
+    calls = client.plugins["xep_0444"].set_reactions.call_args_list
     # First call removes 👀, second sends ✅
-    assert calls[-1].kwargs.get("reactions") == ["✅"]
+    assert calls[-1].args[2] == ["✅"]
     assert "msg-r1" not in adapter_instance._pending_reactions
 
 
@@ -397,8 +397,8 @@ async def test_reaction_lifecycle_failure(adapter_instance):
 
     await adapter_instance.on_processing_start(evt)
     await adapter_instance.on_processing_complete(evt, ProcessingOutcome.FAILURE)
-    calls = client.plugins["xep_0444"].send_reactions.call_args_list
-    assert calls[-1].kwargs.get("reactions") == ["❌"]
+    calls = client.plugins["xep_0444"].set_reactions.call_args_list
+    assert calls[-1].args[2] == ["❌"]
 
 
 @pytest.mark.asyncio
@@ -416,10 +416,10 @@ async def test_reaction_cancelled_sends_no_final(adapter_instance):
 
     await adapter_instance.on_processing_start(evt)
     await adapter_instance.on_processing_complete(evt, ProcessingOutcome.CANCELLED)
-    calls = client.plugins["xep_0444"].send_reactions.call_args_list
+    calls = client.plugins["xep_0444"].set_reactions.call_args_list
     # Only 👀 was sent; no final reaction
     assert len(calls) == 1
-    assert calls[0].kwargs.get("reactions") == ["👀"]
+    assert calls[0].args[2] == ["👀"]
 
 
 # -----------------------------------------------------------------
