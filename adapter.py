@@ -342,7 +342,14 @@ class XmppAdapter(BasePlatformAdapter):
     # Lifecycle
     # -----------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # ``is_reconnect`` is part of the BasePlatformAdapter.connect contract:
+        # the gateway's reconnect watcher (gateway/run.py) rebuilds a fresh
+        # adapter after a fatal error and calls ``connect(is_reconnect=True)``.
+        # The adapter MUST accept the kwarg or that recovery path raises
+        # TypeError and XMPP can never reconnect. We currently build a fresh
+        # slixmpp client every call, so the flag is accepted but not used.
+        del is_reconnect
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
         for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0363"):
