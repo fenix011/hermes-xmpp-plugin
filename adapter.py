@@ -352,7 +352,7 @@ class XmppAdapter(BasePlatformAdapter):
         del is_reconnect
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0363"):
+        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0203", "xep_0363"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -394,8 +394,11 @@ class XmppAdapter(BasePlatformAdapter):
         client.force_starttls = True  # type: ignore[attr-defined,reportAttributeAccessIssue]
 
         client.add_event_handler("session_start", self._on_session_start)
+        # slixmpp dispatches MUC stanzas to BOTH "message" and
+        # "groupchat_message", so registering _on_message for both would run it
+        # twice for every group-chat message. Register "message" only — it
+        # already covers private (chat/normal) and groupchat stanzas.
         client.add_event_handler("message", self._on_message)
-        client.add_event_handler("groupchat_message", self._on_message)
         client.add_event_handler("disconnected", self._on_disconnected)
         client.add_event_handler("failed_auth", self._on_failed_auth)
 
@@ -517,6 +520,21 @@ class XmppAdapter(BasePlatformAdapter):
             if from_bare == self._self_bare:
                 return
 
+            # In a MUC the stanza's `from` is room@host/nick, so the bare-JID
+            # check above never matches our own JID. Reflected messages (and
+            # MUC history replay on join) carry our own nick as the resource —
+            # skip them, otherwise the bot replies to itself in an endless loop.
+            if stanza_type == "groupchat":
+                room_nick = self._muc_room_nick(from_bare) or self.muc_nick
+                if from_resource and from_resource == room_nick:
+                    return
+                # MUC history replay carries a delay stamp; ignore old messages.
+                try:
+                    if stanza.get_plugin("delay", check=True) is not None:
+                        return
+                except (AttributeError, TypeError):
+                    pass
+
             body = stanza["body"] or ""
             stanza_to_dispatch = stanza
 
@@ -609,6 +627,17 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return None
+
+    def _muc_room_nick(self, room_bare: str) -> Optional[str]:
+        """Return the nick we joined a given MUC room under.
+
+        Rooms may be configured with a per-room nick (room/nick); fall back to
+        the global muc_nick when no specific match is found.
+        """
+        for room in self.muc_rooms:
+            if room.room == room_bare:
+                return room.nick or self.muc_nick
+        return self.muc_nick
 
     def _is_authorized(self, *, chat_type: str, chat_id: str, user_jid: str) -> bool:
         if self.allow_all_users:
