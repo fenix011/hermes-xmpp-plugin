@@ -1,0 +1,58 @@
+#+TITLE: 'Hermes XMPP plugin  BUGS.org file'
+#+AUTHOR: Fénix
+#+DATE: <2026-01-01>
+#+EMAIL: fenix@librebits.info
+#+FILETAGS: :proyecto:desarrollo:
+
+#+TODO: BUG TESTING | ERROR FIXED DEPRECATED
+#+STARTUP: overview hidestars
+
+
+* DONE after hermes xmpp bot proper setup, it fails to connect - fix 
+:PROPERTIES:
+:STATUS:   ACTIVE
+:CREATED:  [2026-02-20]
+:SEVERITY: [HIGH/MEDIUM/LOW]
+:END:
+
+*** Steps to Reproduce
+
+```bash
+$ hermes gateway status
+● hermes-gateway.service - Hermes Agent Gateway - Messaging Platform Integration
+     Loaded: loaded (/home/fenix/.config/systemd/user/hermes-gateway.service; enabled; preset: enabled)
+     Active: active (running) since Mon 2026-06-29 15:34:01 CEST; 18min ago
+ Invocation: bfdc36983dd44a1d9d55812e25e52ddd
+   Main PID: 313638 (hermes)
+      Tasks: 7 (limit: 28307)
+     Memory: 110.7M (peak: 123.3M)
+        CPU: 6.316s
+     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service
+             └─313638 /home/fenix/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+
+Jun 29 15:34:01 anka4 systemd[2095]: Started hermes-gateway.service - Hermes Agent Gateway - Messaging Platform Integration.
+Jun 29 15:34:05 anka4 python[313638]: ERROR gateway.run: ✗ xmpp error: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect'
+Jun 29 15:34:05 anka4 python[313638]: WARNING gateway.run: Gateway started with no connected platforms — 1 platform(s) queued for retry: xmpp: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect'
+Jun 29 15:34:05 anka4 python[313638]: WARNING gateway.run: No adapter could be created for any of the 1 configured platform(s). Check that required dependencies are installed and credentials are set. Gateway will continue for cron job execution.
+Jun 29 15:34:35 anka4 python[313638]: WARNING gateway.run: Reconnect xmpp error: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect', next retry in 60s
+Jun 29 15:35:35 anka4 python[313638]: WARNING gateway.run: Reconnect xmpp error: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect', next retry in 120s
+Jun 29 15:39:54 anka4 python[313638]: WARNING gateway.run: Reconnect xmpp error: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect', next retry in 240s
+Jun 29 15:43:54 anka4 python[313638]: WARNING gateway.run: Reconnect xmpp error: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect', next retry in 300s
+Jun 29 15:48:55 anka4 python[313638]: WARNING gateway.run: Reconnect xmpp error: XmppAdapter.connect() got an unexpected keyword argument 'is_reconnect', next retry in 300s
+✓ User gateway service is running
+✓ Systemd linger is enabled (service survives logout)
+fenix@anka4 ~/.hermes 
+$
+```
+*** Expected Behavior
+[What should happen]
+
+*** Actual Behavior
+[What actually happens]
+
+*** Investigation Notes
+- [Notes from debugging]
+
+*** Potential Fix
+- see patch 
+ 
